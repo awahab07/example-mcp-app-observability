@@ -18,6 +18,13 @@ import path from "path";
 import { fileURLToPath } from "url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const kibanaPortableServiceMapRoot = path.resolve(
+  __dirname,
+  "../kibana/x-pack/solutions/observability/plugins/apm/public/components/shared/service_map"
+);
+const reactRoot = path.resolve(__dirname, "node_modules/react");
+const reactDomRoot = path.resolve(__dirname, "node_modules/react-dom");
+const xyflowRoot = path.resolve(__dirname, "node_modules/@xyflow/react");
 
 export default defineConfig({
   root: path.resolve(__dirname, "harness"),
@@ -26,8 +33,12 @@ export default defineConfig({
     port: 5371,
     open: "/",
     strictPort: false,
+    fs: {
+      allow: [__dirname, kibanaPortableServiceMapRoot],
+    },
   },
   resolve: {
+    dedupe: ["react", "react-dom", "@xyflow/react"],
     alias: [
       // Swap the postMessage-based hook for our in-process mock.
       {
@@ -38,6 +49,38 @@ export default defineConfig({
       {
         find: /^@shared\/(.*)$/,
         replacement: path.resolve(__dirname, "src/shared/$1"),
+      },
+      {
+        find: "@kibana-apm-service-map",
+        replacement: path.resolve(kibanaPortableServiceMapRoot, "portable_service_map.tsx"),
+      },
+      {
+        find: "@kibana-apm-service-map-state",
+        replacement: path.resolve(kibanaPortableServiceMapRoot, "portable_service_map_state.ts"),
+      },
+      {
+        find: "react",
+        replacement: reactRoot,
+      },
+      {
+        find: "react/jsx-runtime",
+        replacement: path.resolve(reactRoot, "jsx-runtime.js"),
+      },
+      {
+        find: "react/jsx-dev-runtime",
+        replacement: path.resolve(reactRoot, "jsx-dev-runtime.js"),
+      },
+      {
+        find: "react-dom",
+        replacement: reactDomRoot,
+      },
+      {
+        find: "react-dom/client",
+        replacement: path.resolve(reactDomRoot, "client.js"),
+      },
+      {
+        find: "@xyflow/react",
+        replacement: xyflowRoot,
       },
     ],
   },

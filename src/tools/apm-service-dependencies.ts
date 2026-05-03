@@ -257,7 +257,7 @@ FROM traces-*.otel-*
     traces_span_count = COUNT(*),
     avg_duration_us = AVG(duration_us),
     p99_duration_us = PERCENTILE(duration_us, 99),
-    error_count = COUNT(CASE(status.code == "Error", 1, NULL))
+    error_count = COUNT(*) WHERE event.outcome == "failure"
   BY service.name
 | LIMIT 200
 `;

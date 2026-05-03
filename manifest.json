@@ -54,6 +54,10 @@
       "description": "Service dependency graph from APM telemetry. Requires: Elastic APM."
     },
     {
+      "name": "apm-service-map",
+      "description": "Interactive Kibana-backed APM service map for focused services or derived scopes like erroring, spiking, and silent services. Requires: Kibana URL configured and Elastic APM."
+    },
+    {
       "name": "manage-alerts",
       "description": "CRUD for Kibana alerting rules — create, list, get, or delete custom-threshold rules. Universal: works on any metric field in any index pattern. Registered only when a Kibana URL is configured; leave the Kibana URL blank to disable this tool (and its destructive delete path)."
     }

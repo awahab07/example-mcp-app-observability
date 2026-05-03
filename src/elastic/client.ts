@@ -70,14 +70,18 @@ export async function esRequest<T = unknown>(
   options: {
     method?: string;
     body?: unknown;
-    params?: Record<string, string>;
+    params?: Record<string, string | string[]>;
   } = {}
 ): Promise<T> {
   const config = getConfig();
   const url = new URL(path, config.elasticsearchUrl);
   if (options.params) {
     for (const [k, v] of Object.entries(options.params)) {
-      url.searchParams.set(k, v);
+      if (Array.isArray(v)) {
+        v.forEach((value) => url.searchParams.append(k, value));
+      } else {
+        url.searchParams.set(k, v);
+      }
     }
   }
 
@@ -112,7 +116,7 @@ export async function kibanaRequest<T = unknown>(
   options: {
     method?: string;
     body?: unknown;
-    params?: Record<string, string>;
+    params?: Record<string, string | string[]>;
     apiVersion?: string;
   } = {}
 ): Promise<T> {
@@ -120,7 +124,11 @@ export async function kibanaRequest<T = unknown>(
   const url = new URL(config.kibanaUrl + path);
   if (options.params) {
     for (const [k, v] of Object.entries(options.params)) {
-      url.searchParams.set(k, v);
+      if (Array.isArray(v)) {
+        v.forEach((value) => url.searchParams.append(k, value));
+      } else {
+        url.searchParams.set(k, v);
+      }
     }
   }
 

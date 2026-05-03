@@ -11,6 +11,7 @@ import { registerObserveTool } from "./tools/observe.js";
 import { registerApmHealthSummaryTool } from "./tools/apm-health-summary.js";
 import { registerK8sBlastRadiusTool } from "./tools/k8s-blast-radius.js";
 import { registerApmServiceDependenciesTool } from "./tools/apm-service-dependencies.js";
+import { registerApmServiceMapTool } from "./tools/apm-service-map.js";
 import { registerManageAlertsTool } from "./tools/manage-alerts.js";
 import { registerSetupDismissTool } from "./tools/setup-dismiss.js";
 import { isKibanaConfigured } from "./elastic/client.js";
@@ -27,12 +28,10 @@ export function createServer(): McpServer {
   registerK8sBlastRadiusTool(server);
   registerApmServiceDependenciesTool(server);
 
-  // manage-alerts hits Kibana APIs and can delete persistent rules. Gate its
-  // registration on an explicit KIBANA_URL so operators can selectively disable
-  // the tool (and its destructive operation=delete path) by leaving `kibana_url`
-  // blank in the install config. When unregistered the LLM never sees the tool
-  // and can't invoke it.
+  // Tools that depend on Kibana APIs are gated on an explicit KIBANA_URL so
+  // ES-only deployments never see tools that cannot work.
   if (isKibanaConfigured()) {
+    registerApmServiceMapTool(server);
     registerManageAlertsTool(server);
   }
 

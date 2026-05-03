@@ -13,7 +13,13 @@
     "noEmit": true,
     "lib": ["ES2022", "DOM", "DOM.Iterable"],
     "paths": {
-      "@shared/*": ["./src/shared/*"]
+      "@shared/*": ["./src/shared/*"],
+      "@kibana-apm-service-map": [
+        "../kibana/x-pack/solutions/observability/plugins/apm/public/components/shared/service_map/portable_service_map.tsx"
+      ],
+      "@kibana-apm-service-map-state": [
+        "../kibana/x-pack/solutions/observability/plugins/apm/public/components/shared/service_map/portable_service_map_state.ts"
+      ]
     }
   },
   "include": ["src/**/*", "main.ts", "vite.config.ts", "vite.harness.config.ts", "harness/**/*", "scripts/**/*"],
