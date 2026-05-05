@@ -584,11 +584,11 @@ const DS_STYLESHEET = `
     gap: 6px;
     padding: 3px 10px;
     border-radius: 20px;
-    background: var(--accent-dim);
-    border: 1px solid var(--border-focus);
+    background: color-mix(in srgb, var(--accent) 14%, var(--bg-panel));
+    border: 1px solid color-mix(in srgb, var(--accent) 45%, var(--border));
     font-family: var(--font-mono);
     font-size: 11px;
-    color: var(--accent);
+    color: var(--text-primary);
     max-width: 100%;
     min-width: 0;
   }
@@ -601,7 +601,7 @@ const DS_STYLESHEET = `
   .ds-query-pill button {
     background: transparent;
     border: none;
-    color: var(--accent);
+    color: var(--text-primary);
     cursor: pointer;
     font-size: 14px;
     line-height: 1;

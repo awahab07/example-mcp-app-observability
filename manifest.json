@@ -55,7 +55,7 @@
     },
     {
       "name": "apm-service-map",
-      "description": "Interactive Kibana-backed APM service map for focused services or derived scopes like erroring, spiking, and silent services. Requires: Kibana URL configured and Elastic APM."
+      "description": "Interactive Kibana-backed APM service map for RCA and topology work. Use it to focus a service, highlight erroring/spiking/silent scopes, and retry with wider time windows when the requested scope is empty. Requires: Kibana URL configured and Elastic APM."
     },
     {
       "name": "manage-alerts",

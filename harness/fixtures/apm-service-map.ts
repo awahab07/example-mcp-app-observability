@@ -22,6 +22,9 @@ const incidentBaseNodes = [
       label: "frontend-web",
       isService: true,
       agentName: "rum-js",
+      alertsCount: 1,
+      sloStatus: "degrading",
+      serviceAnomalyStats: { healthStatus: "warning" },
     },
   },
   {
@@ -33,6 +36,9 @@ const incidentBaseNodes = [
       label: "product-recommendation",
       isService: true,
       agentName: "go",
+      alertsCount: 2,
+      sloStatus: "violated",
+      serviceAnomalyStats: { healthStatus: "critical" },
     },
   },
   {
@@ -44,6 +50,9 @@ const incidentBaseNodes = [
       label: "inventory-service",
       isService: true,
       agentName: "nodejs",
+      alertsCount: 5,
+      sloStatus: "violated",
+      serviceAnomalyStats: { healthStatus: "critical" },
     },
   },
   {
@@ -79,6 +88,8 @@ const incidentBaseNodes = [
       label: "user-preference-service",
       isService: true,
       agentName: "python",
+      sloStatus: "healthy",
+      serviceAnomalyStats: { healthStatus: "healthy" },
     },
   },
   {
@@ -191,6 +202,87 @@ function incidentNodes(highlightedServiceNames: string[]) {
       : node
   );
 }
+
+const groupedResourceNodes = [
+  {
+    id: "checkout",
+    type: "service",
+    position: { x: 60, y: 170 },
+    data: {
+      id: "checkout",
+      label: "checkout",
+      isService: true,
+      agentName: "go",
+      alertsCount: 2,
+      sloStatus: "degrading",
+      serviceAnomalyStats: { healthStatus: "warning" },
+    },
+  },
+  {
+    id: "inventory",
+    type: "service",
+    position: { x: 340, y: 170 },
+    data: {
+      id: "inventory",
+      label: "inventory",
+      isService: true,
+      agentName: "nodejs",
+      sloStatus: "healthy",
+      serviceAnomalyStats: { healthStatus: "healthy" },
+    },
+  },
+  {
+    id: "resourceGroup{checkout;inventory}",
+    type: "groupedResources",
+    position: { x: 640, y: 170 },
+    data: {
+      id: "resourceGroup{checkout;inventory}",
+      label: "4 resources",
+      isService: false,
+      isGrouped: true,
+      count: 4,
+      spanType: "external",
+      spanSubtype: "http",
+      groupedConnections: [
+        { id: "payments-api", label: "payments-api", spanType: "external", spanSubtype: "http" },
+        { id: "pricing-api", label: "pricing-api", spanType: "external", spanSubtype: "http" },
+        { id: "currency-api", label: "currency-api", spanType: "external", spanSubtype: "http" },
+        { id: "profile-api", label: "profile-api", spanType: "external", spanSubtype: "http" },
+      ],
+    },
+  },
+];
+
+const groupedResourceEdges = [
+  {
+    id: "checkout~grouped-resources",
+    source: "checkout",
+    target: "resourceGroup{checkout;inventory}",
+    type: "default",
+    style: edgeStyle,
+    markerEnd: edgeMarker,
+    data: {
+      sourceLabel: "checkout",
+      targetLabel: "4 resources",
+      isGrouped: true,
+      resources: ["payments-api", "pricing-api"],
+    },
+  },
+  {
+    id: "inventory~grouped-resources",
+    source: "inventory",
+    target: "resourceGroup{checkout;inventory}",
+    type: "default",
+    style: edgeStyle,
+    markerEnd: edgeMarker,
+    data: {
+      sourceLabel: "inventory",
+      targetLabel: "4 resources",
+      isGrouped: true,
+      resources: ["currency-api", "profile-api"],
+    },
+  },
+];
 
 export const apmServiceMapFixtures: FixtureSet = {
   focusedCheckout: fixture(
@@ -355,6 +447,50 @@ export const apmServiceMapFixtures: FixtureSet = {
       ],
     },
     "Show me the service map for checkout."
+  ),
+  groupedResources: fixture(
+    "Grouped external resources",
+    {
+      summary: "Service map with 2 services, 1 grouped dependency cluster, and 2 relationships.",
+      request_context: {
+        intent: "global",
+        environment: "production",
+        range_from: "now-30m",
+        range_to: "now",
+      },
+      derived_scope: null,
+      view_state: {
+        version: "1",
+        rangeFrom: "now-30m",
+        rangeTo: "now",
+        environment: "production",
+        kuery: "",
+        highlightedServiceNames: [],
+        filters: {
+          alertStatusFilter: [],
+          sloStatusFilter: [],
+          anomalyStatusFilter: [],
+        },
+        orientation: "horizontal",
+      },
+      graph: {
+        nodes: groupedResourceNodes,
+        edges: groupedResourceEdges,
+        nodesCount: 3,
+        tracesCount: 918,
+        service_count: 2,
+        edge_count: 2,
+        full_map_url:
+          "https://localhost:5601/app/apm#/service-map?rangeFrom=now-30m&rangeTo=now&environment=production",
+      },
+      investigation_actions: [
+        {
+          label: "Inspect grouped resources",
+          prompt: 'Show me the dependencies for checkout and inventory that are being grouped together.',
+        },
+      ],
+    },
+    "Show me grouped external resources on the service map."
   ),
   erroringScope: fixture(
     "Erroring services scope",
@@ -579,6 +715,42 @@ export const apmServiceMapFixtures: FixtureSet = {
         full_map_url:
           "http://localhost:5601/app/apm#/services/frontend-web/service-map?rangeFrom=now-45m&rangeTo=now&environment=Synthtrace%3A+cascading_failure",
       },
+      investigation_objects: [
+        {
+          id: "alert:frontend-web-latency:cluster:search-demo",
+          kind: "alert",
+          title: "Frontend latency spike",
+          subtitle: "Active · search-demo",
+          summary: "User-facing latency is spiking across the recommendation path.",
+          shortLabel: "AL",
+          badge: 2,
+          tone: "critical",
+          score: 560,
+          status: "active",
+          focusServiceName: "product-recommendation",
+          highlightedServiceNames: ["product-recommendation", "inventory-service", "frontend-web"],
+          clusterName: "search-demo",
+          kibanaUrl:
+            "http://localhost:5601/app/observability/alerts/frontend-latency-spike",
+        },
+        {
+          id: "slo:recommendation-burn-rate:cluster:search-demo",
+          kind: "slo",
+          title: "Recommendation availability burn rate",
+          subtitle: "Active · search-demo",
+          summary: "The recommendation SLO is degrading and points toward the inventory dependency.",
+          shortLabel: "SL",
+          badge: 1,
+          tone: "warning",
+          score: 520,
+          status: "active",
+          focusServiceName: "inventory-service",
+          highlightedServiceNames: ["inventory-service", "product-recommendation", "frontend-web"],
+          clusterName: "search-demo",
+          kibanaUrl:
+            "http://localhost:5601/app/observability/alerts/recommendation-burn-rate",
+        },
+      ],
       investigation_actions: [
         {
           label: "Investigate frontend-web",

@@ -18,6 +18,14 @@ import { safeEsqlRows } from "../elastic/esql.js";
 import { buildServiceFilter, resolveNamespace } from "../elastic/apm.js";
 import { resolveViewPath } from "./view-path.js";
 import { consumeWelcomeNotice } from "../setup/notice.js";
+import {
+  applyPortableGraphState,
+  buildPortableGraphFromRawResponse,
+  getServiceNamesFromGraph,
+  mergePortableGraphWithBadges,
+  type RawServiceMapResponse,
+  type ServiceMapBadgeResponse,
+} from "./apm_service_map_fallback.js";
 
 const RESOURCE_URI = "ui://apm-service-map/mcp-app.html";
 const ENVIRONMENT_ALL = "ENVIRONMENT_ALL";
@@ -25,6 +33,10 @@ const DEFAULT_RANGE_FROM = "now-1h";
 const DEFAULT_RANGE_TO = "now";
 const DEFAULT_ORIENTATION = "horizontal";
 const MAX_HIGHLIGHTED_SERVICES = 12;
+const MAX_INVESTIGATION_OBJECTS = 8;
+const MAX_RELATED_CLUSTERS = 2;
+const MAX_RELATED_ALERT_HITS = 40;
+const MAX_SERVICE_NAMES_FOR_RAC = 120;
 const MINUTE_MS = 60_000;
 const HOUR_MS = 60 * MINUTE_MS;
 const DAY_MS = 24 * HOUR_MS;
@@ -101,6 +113,93 @@ interface TimeWindow {
   lookback: string;
 }
 
+type InvestigationObjectKind = "alert" | "slo";
+type InvestigationObjectTone = "critical" | "warning" | "info" | "neutral";
+
+type RacAlertFilterClause =
+  | { terms: { "service.name": string[] } }
+  | { term: { "kibana.alert.status": "active" } }
+  | { term: { "service.environment": string } }
+  | { range: { "@timestamp": { gte: string; lte: string } } };
+
+type RelatedAlertStatus = "active" | "recovered";
+
+type InvestigationAlertFilterClause =
+  | { terms: { "service.name": string[] } }
+  | { terms: { "orchestrator.cluster.name": string[] } }
+  | { terms: { "kibana.alert.status": RelatedAlertStatus[] } }
+  | { term: { "service.environment": string } }
+  | { range: { "@timestamp": { gte: string; lte: string } } };
+
+interface RacAlertsFindResponse {
+  aggregations?: {
+    services?: {
+      buckets?: Array<{
+        key: string;
+        doc_count: number;
+      }>;
+    };
+  };
+}
+
+interface InvestigationObject {
+  id: string;
+  kind: InvestigationObjectKind;
+  title: string;
+  subtitle: string;
+  summary: string;
+  shortLabel: string;
+  badge?: number;
+  tone: InvestigationObjectTone;
+  score: number;
+  status: RelatedAlertStatus;
+  focusServiceName?: string;
+  highlightedServiceNames?: string[];
+  serviceName?: string;
+  clusterName?: string;
+  kibanaUrl?: string;
+}
+
+interface RacAlertHitSource {
+  "@timestamp"?: string;
+  "kibana.alert.uuid"?: string;
+  "kibana.alert.status"?: string;
+  "kibana.alert.reason"?: string;
+  "kibana.alert.rule.name"?: string;
+  "kibana.alert.rule.consumer"?: string;
+  "kibana.alert.rule.category"?: string;
+  "kibana.alert.action_group"?: string;
+  "service.name"?: string | string[];
+  "orchestrator.cluster.name"?: string | string[];
+}
+
+interface RacAlertHit {
+  _source?: RacAlertHitSource;
+}
+
+interface RacAlertHitsResponse {
+  hits?: {
+    hits?: RacAlertHit[];
+  };
+}
+
+interface InvestigationObjectGroup {
+  id: string;
+  kind: InvestigationObjectKind;
+  title: string;
+  latestSummary: string;
+  occurrences: number;
+  status: RelatedAlertStatus;
+  tone: InvestigationObjectTone;
+  badge?: number;
+  score: number;
+  focusServiceName?: string;
+  highlightedServiceNames: string[];
+  serviceName?: string;
+  clusterName?: string;
+  kibanaUrl?: string;
+}
+
 interface KibanaServiceMapNode {
   id: string;
   type: string;
@@ -173,6 +272,12 @@ interface KibanaPortableServiceMapResponse {
   nodesCount: number;
   tracesCount: number;
 }
+
+type KibanaStandardServiceMapResponse =
+  | RawServiceMapResponse
+  | {
+      data: RawServiceMapResponse;
+    };
 
 interface ServiceMapDetailStats {
   label: string;
@@ -273,6 +378,569 @@ function normalizeServiceNames(services?: string[]): string[] {
   return [...new Set(services.map((service) => service.trim()).filter(Boolean))];
 }
 
+function normalizeAlertField(value: string | string[] | undefined): string | undefined {
+  if (typeof value === "string") {
+    const normalized = value.trim();
+    return normalized || undefined;
+  }
+
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const normalized = item.trim();
+      if (normalized) {
+        return normalized;
+      }
+    }
+  }
+
+  return undefined;
+}
+
+function normalizeRelatedAlertStatus(value: string | undefined): RelatedAlertStatus | undefined {
+  if (value === "active" || value === "recovered") {
+    return value;
+  }
+
+  return undefined;
+}
+
+function getAlertTimestampMs(value: string | undefined): number {
+  if (!value) {
+    return 0;
+  }
+
+  const timestamp = Date.parse(value);
+  return Number.isFinite(timestamp) ? timestamp : 0;
+}
+
+function getInvestigationTonePriority(tone: InvestigationObjectTone): number {
+  switch (tone) {
+    case "critical":
+      return 4;
+    case "warning":
+      return 3;
+    case "info":
+      return 2;
+    default:
+      return 1;
+  }
+}
+
+function getServicePriority(node: KibanaServiceMapNode): number {
+  if (!node.data.isService) {
+    return 0;
+  }
+
+  let score = 0;
+
+  if (typeof node.data.alertsCount === "number" && node.data.alertsCount > 0) {
+    score += 100 + node.data.alertsCount;
+  }
+
+  if (node.data.sloStatus === "violated") {
+    score += 80;
+  } else if (node.data.sloStatus === "degrading") {
+    score += 45;
+  }
+
+  const anomalyStatus = node.data.serviceAnomalyStats?.healthStatus;
+  if (anomalyStatus === "critical" || anomalyStatus === "major") {
+    score += 70;
+  } else if (anomalyStatus === "warning") {
+    score += 35;
+  }
+
+  if (node.data.contextHighlight) {
+    score += 25;
+  }
+
+  return score;
+}
+
+function buildGraphServicePriorityMap(graph: KibanaPortableServiceMapResponse): Map<string, number> {
+  return new Map(
+    graph.nodes
+      .filter((node) => node.data.isService)
+      .map((node) => [String(node.data.label ?? node.id), getServicePriority(node)] as const)
+  );
+}
+
+function buildGraphNeighborsByService(
+  graph: KibanaPortableServiceMapResponse
+): Map<string, string[]> {
+  const nodeById = new Map(graph.nodes.map((node) => [node.id, node] as const));
+  const neighborsByService = new Map<string, Set<string>>();
+
+  const link = (leftServiceName: string, rightServiceName: string) => {
+    let current = neighborsByService.get(leftServiceName);
+    if (!current) {
+      current = new Set<string>();
+      neighborsByService.set(leftServiceName, current);
+    }
+    current.add(rightServiceName);
+  };
+
+  for (const edge of graph.edges) {
+    const sourceNode = nodeById.get(edge.source);
+    const targetNode = nodeById.get(edge.target);
+    if (!sourceNode || !targetNode) {
+      continue;
+    }
+
+    const sourceServiceName = sourceNode.data.isService
+      ? String(sourceNode.data.label ?? sourceNode.id)
+      : undefined;
+    const targetServiceName = targetNode.data.isService
+      ? String(targetNode.data.label ?? targetNode.id)
+      : undefined;
+
+    if (sourceServiceName && targetServiceName) {
+      link(sourceServiceName, targetServiceName);
+      link(targetServiceName, sourceServiceName);
+    }
+  }
+
+  return new Map(
+    [...neighborsByService.entries()].map(([serviceName, neighbors]) => [
+      serviceName,
+      [...neighbors].sort((left, right) => left.localeCompare(right)),
+    ])
+  );
+}
+
+function getRelatedServiceNames(args: {
+  focusServiceName: string | undefined;
+  neighborsByService: Map<string, string[]>;
+  servicePriority: Map<string, number>;
+}): string[] {
+  if (!args.focusServiceName) {
+    return [];
+  }
+
+  const rankedNeighbors = [...(args.neighborsByService.get(args.focusServiceName) ?? [])].sort(
+    (left, right) =>
+      (args.servicePriority.get(right) ?? 0) - (args.servicePriority.get(left) ?? 0) ||
+      left.localeCompare(right)
+  );
+
+  return normalizeServiceNames([args.focusServiceName, ...rankedNeighbors.slice(0, 4)]).slice(
+    0,
+    MAX_HIGHLIGHTED_SERVICES
+  );
+}
+
+function isSloRelatedAlert(source: RacAlertHitSource): boolean {
+  return (
+    source["kibana.alert.rule.consumer"] === "slo" ||
+    source["kibana.alert.rule.category"]?.toLowerCase().includes("slo") === true
+  );
+}
+
+function getInvestigationObjectTone(source: RacAlertHitSource): InvestigationObjectTone {
+  const status = normalizeRelatedAlertStatus(source["kibana.alert.status"]);
+  const actionGroup = source["kibana.alert.action_group"];
+
+  if (isSloRelatedAlert(source)) {
+    if (actionGroup === "slo.burnRate.alert" || actionGroup === "slo.burnRate.high") {
+      return "critical";
+    }
+    if (actionGroup === "slo.burnRate.medium") {
+      return "warning";
+    }
+    if (actionGroup === "slo.burnRate.low") {
+      return "info";
+    }
+  }
+
+  if (status === "active") {
+    return "critical";
+  }
+
+  if (status === "recovered") {
+    return "warning";
+  }
+
+  return "neutral";
+}
+
+function buildAlertPageUrl(alertId: string | undefined): string | undefined {
+  if (!alertId) {
+    return undefined;
+  }
+
+  return `${getConfig().kibanaUrl}/app/observability/alerts/${encodeURIComponent(alertId)}`;
+}
+
+function buildInvestigationObjectMapUrl(args: {
+  timeWindow: TimeWindow;
+  environment: string;
+  kuery: string;
+  serviceGroupId?: string;
+  focusServiceName?: string;
+  highlightedServiceNames: string[];
+}): string | undefined {
+  if (!args.focusServiceName && args.highlightedServiceNames.length === 0) {
+    return undefined;
+  }
+
+  const viewState = normalizePortableViewState({
+    rangeFrom: args.timeWindow.rangeFrom,
+    rangeTo: args.timeWindow.rangeTo,
+    environment: args.environment,
+    kuery: args.kuery,
+    serviceName: args.focusServiceName,
+    serviceGroupId: args.serviceGroupId,
+    highlightedServiceNames: args.highlightedServiceNames,
+  });
+
+  return buildKibanaServiceMapUrl({
+    rangeFrom: args.timeWindow.rangeFrom,
+    rangeTo: args.timeWindow.rangeTo,
+    environment: args.environment,
+    kuery: args.kuery,
+    serviceName: args.focusServiceName,
+    serviceGroupId: args.serviceGroupId,
+    serviceMapState: viewState,
+  });
+}
+
+function dedupeAlertHits(hits: RacAlertHit[]): RacAlertHit[] {
+  const seen = new Set<string>();
+  const unique: RacAlertHit[] = [];
+
+  for (const hit of hits) {
+    const source = hit._source;
+    if (!source) {
+      continue;
+    }
+
+    const dedupeKey =
+      source["kibana.alert.uuid"] ||
+      [
+        source["@timestamp"],
+        source["kibana.alert.rule.name"],
+        normalizeAlertField(source["service.name"]),
+        normalizeAlertField(source["orchestrator.cluster.name"]),
+      ].join("|");
+
+    if (seen.has(dedupeKey)) {
+      continue;
+    }
+
+    seen.add(dedupeKey);
+    unique.push(hit);
+  }
+
+  return unique;
+}
+
+async function fetchRelatedAlertHits(args: {
+  timeWindow: TimeWindow;
+  serviceNames?: string[];
+  clusterNames?: string[];
+  environment?: string;
+}): Promise<RacAlertHit[]> {
+  const filterClauses: InvestigationAlertFilterClause[] = [
+    {
+      terms: {
+        "kibana.alert.status": ["active", "recovered"],
+      },
+    },
+    {
+      range: {
+        "@timestamp": {
+          gte: args.timeWindow.startIso,
+          lte: args.timeWindow.endIso,
+        },
+      },
+    },
+  ];
+
+  if (args.serviceNames?.length) {
+    filterClauses.push({
+      terms: {
+        "service.name": args.serviceNames.slice(0, MAX_SERVICE_NAMES_FOR_RAC),
+      },
+    });
+  } else if (args.clusterNames?.length) {
+    filterClauses.push({
+      terms: {
+        "orchestrator.cluster.name": args.clusterNames.slice(0, MAX_RELATED_CLUSTERS),
+      },
+    });
+  } else {
+    return [];
+  }
+
+  if (args.environment && args.environment !== ENVIRONMENT_ALL && args.serviceNames?.length) {
+    filterClauses.push({
+      term: {
+        "service.environment": args.environment,
+      },
+    });
+  }
+
+  const response = await kibanaRequest<RacAlertHitsResponse>("/internal/rac/alerts/find", {
+    method: "POST",
+    body: {
+      size: MAX_RELATED_ALERT_HITS,
+      query: {
+        bool: {
+          filter: filterClauses,
+        },
+      },
+      sort: [
+        {
+          "@timestamp": {
+            order: "desc",
+          },
+        },
+      ],
+    },
+  });
+
+  return response.hits?.hits ?? [];
+}
+
+async function buildInvestigationObjects(args: {
+  graph: KibanaPortableServiceMapResponse;
+  timeWindow: TimeWindow;
+  environment: string;
+  kuery: string;
+  serviceGroupId?: string;
+}): Promise<InvestigationObject[]> {
+  const serviceNames = normalizeServiceNames(
+    args.graph.nodes
+      .filter((node) => node.data.isService)
+      .map((node) => String(node.data.label ?? node.id))
+  ).slice(0, MAX_SERVICE_NAMES_FOR_RAC);
+  if (serviceNames.length === 0) {
+    return [];
+  }
+
+  const servicePriority = buildGraphServicePriorityMap(args.graph);
+  const neighborsByService = buildGraphNeighborsByService(args.graph);
+  const serviceAlertHits = await fetchRelatedAlertHits({
+    timeWindow: args.timeWindow,
+    serviceNames,
+    environment: args.environment,
+  });
+
+  const clusterStats = new Map<string, { count: number; score: number; services: Set<string> }>();
+  for (const hit of serviceAlertHits) {
+    const source = hit._source;
+    if (!source) {
+      continue;
+    }
+
+    const clusterName = normalizeAlertField(source["orchestrator.cluster.name"]);
+    const serviceName = normalizeAlertField(source["service.name"]);
+    if (!clusterName || !serviceName) {
+      continue;
+    }
+
+    const serviceScore = servicePriority.get(serviceName) ?? 0;
+    const statusBonus = normalizeRelatedAlertStatus(source["kibana.alert.status"]) === "active" ? 10 : 5;
+    const current = clusterStats.get(clusterName) ?? { count: 0, score: 0, services: new Set<string>() };
+    current.count += 1;
+    current.score += serviceScore + statusBonus;
+    current.services.add(serviceName);
+    clusterStats.set(clusterName, current);
+  }
+
+  const topClusters = [...clusterStats.entries()]
+    .sort(
+      (left, right) =>
+        right[1].score - left[1].score ||
+        right[1].count - left[1].count ||
+        left[0].localeCompare(right[0])
+    )
+    .slice(0, MAX_RELATED_CLUSTERS)
+    .map(([clusterName]) => clusterName);
+
+  const clusterAlertHits = topClusters.length
+    ? await fetchRelatedAlertHits({
+        timeWindow: args.timeWindow,
+        clusterNames: topClusters,
+      })
+    : [];
+
+  const groupedObjects = new Map<string, InvestigationObjectGroup>();
+  const relatedAlertHits = dedupeAlertHits([...serviceAlertHits, ...clusterAlertHits]).sort(
+    (left, right) =>
+      getAlertTimestampMs(right._source?.["@timestamp"]) -
+      getAlertTimestampMs(left._source?.["@timestamp"])
+  );
+
+  for (const hit of relatedAlertHits) {
+    const source = hit._source;
+    if (!source) {
+      continue;
+    }
+
+    const status = normalizeRelatedAlertStatus(source["kibana.alert.status"]);
+    const title = source["kibana.alert.rule.name"]?.trim();
+    if (!status || !title) {
+      continue;
+    }
+
+    const kind: InvestigationObjectKind = isSloRelatedAlert(source) ? "slo" : "alert";
+    const serviceName = normalizeAlertField(source["service.name"]);
+    const clusterName = normalizeAlertField(source["orchestrator.cluster.name"]);
+    const focusCandidates = clusterName ? [...(clusterStats.get(clusterName)?.services ?? [])] : [];
+    const focusServiceName = normalizeServiceNames([
+      ...(serviceName ? [serviceName] : []),
+      ...focusCandidates.sort(
+        (left, right) =>
+          (servicePriority.get(right) ?? 0) - (servicePriority.get(left) ?? 0) ||
+          left.localeCompare(right)
+      ),
+    ])[0];
+
+    const highlightedServiceNames = getRelatedServiceNames({
+      focusServiceName,
+      neighborsByService,
+      servicePriority,
+    });
+    const tone = getInvestigationObjectTone(source);
+    const latestSummary = source["kibana.alert.reason"]?.trim() || "Recent investigation signal";
+    const scopeId = serviceName ? `service:${serviceName}` : clusterName ? `cluster:${clusterName}` : "scope";
+    const groupId = `${kind}:${title}:${scopeId}`;
+    const count = (groupedObjects.get(groupId)?.occurrences ?? 0) + 1;
+    const focusMapUrl = buildInvestigationObjectMapUrl({
+      timeWindow: args.timeWindow,
+      environment: args.environment,
+      kuery: args.kuery,
+      serviceGroupId: args.serviceGroupId,
+      focusServiceName,
+      highlightedServiceNames,
+    });
+
+    const score =
+      (status === "active" ? 520 : 360) +
+      getInvestigationTonePriority(tone) * 40 +
+      count * 6 +
+      (focusServiceName ? (servicePriority.get(focusServiceName) ?? 0) : 0);
+
+    const previous = groupedObjects.get(groupId);
+    groupedObjects.set(groupId, {
+      id: groupId,
+      kind,
+      title,
+      latestSummary: previous?.latestSummary ?? latestSummary,
+      occurrences: count,
+      status: previous?.status === "active" || status === "active" ? "active" : "recovered",
+      tone:
+        previous && getInvestigationTonePriority(previous.tone) > getInvestigationTonePriority(tone)
+          ? previous.tone
+          : tone,
+      badge: count > 1 ? count : undefined,
+      score: previous ? Math.max(previous.score, score) + (count > 1 ? 2 : 0) : score,
+      focusServiceName: focusServiceName ?? previous?.focusServiceName,
+      highlightedServiceNames:
+        highlightedServiceNames.length > 0
+          ? highlightedServiceNames
+          : (previous?.highlightedServiceNames ?? []),
+      serviceName: serviceName ?? previous?.serviceName,
+      clusterName: clusterName ?? previous?.clusterName,
+      kibanaUrl:
+        buildAlertPageUrl(source["kibana.alert.uuid"]) ??
+        focusMapUrl ??
+        previous?.kibanaUrl,
+    });
+  }
+
+  return [...groupedObjects.values()]
+    .sort((left, right) => right.score - left.score || left.title.localeCompare(right.title))
+    .slice(0, MAX_INVESTIGATION_OBJECTS)
+    .map((item) => ({
+      id: item.id,
+      kind: item.kind,
+      title: item.title,
+      subtitle: [
+        item.status === "active" ? "Active" : "Recovered",
+        item.clusterName ? item.clusterName : item.serviceName ? item.serviceName : undefined,
+      ]
+        .filter(Boolean)
+        .join(" · "),
+      summary: item.latestSummary,
+      shortLabel: item.kind === "slo" ? "SL" : "AL",
+      badge: item.badge,
+      tone: item.tone,
+      score: item.score,
+      status: item.status,
+      focusServiceName: item.focusServiceName,
+      highlightedServiceNames: item.highlightedServiceNames,
+      serviceName: item.serviceName,
+      clusterName: item.clusterName,
+      kibanaUrl: item.kibanaUrl,
+    }));
+}
+
+async function fetchServiceBadgesFromRacAlerts(args: {
+  serviceNames: string[];
+  timeWindow: TimeWindow;
+  environment: string;
+}): Promise<ServiceMapBadgeResponse> {
+  const filterClauses: RacAlertFilterClause[] = [
+    { terms: { "service.name": args.serviceNames } },
+    { term: { "kibana.alert.status": "active" } },
+    {
+      range: {
+        "@timestamp": {
+          gte: args.timeWindow.startIso,
+          lte: args.timeWindow.endIso,
+        },
+      },
+    },
+  ];
+
+  if (args.environment !== ENVIRONMENT_ALL) {
+    filterClauses.push({
+      term: {
+        "service.environment": args.environment,
+      },
+    });
+  }
+
+  const response = await kibanaRequest<RacAlertsFindResponse>("/internal/rac/alerts/find", {
+    method: "POST",
+    body: {
+      size: 0,
+      query: {
+        bool: {
+          filter: filterClauses,
+        },
+      },
+      aggs: {
+        services: {
+          terms: {
+            field: "service.name",
+            size: args.serviceNames.length,
+          },
+        },
+      },
+    },
+  });
+
+  const alerts =
+    response.aggregations?.services?.buckets
+      ?.filter((bucket) => bucket.key.trim().length > 0)
+      .map((bucket) => ({
+        serviceName: bucket.key,
+        alertsCount: bucket.doc_count,
+      }))
+      .sort(
+        (left, right) =>
+          right.alertsCount - left.alertsCount || left.serviceName.localeCompare(right.serviceName)
+      ) ?? [];
+
+  return {
+    alerts,
+    slos: [],
+  };
+}
+
 function normalizePortableViewState(input: {
   rangeFrom: string;
   rangeTo: string;
@@ -312,6 +980,15 @@ function normalizePortableViewState(input: {
 
 function serializePortableViewState(viewState: PortableServiceMapViewState): string {
   return JSON.stringify(viewState);
+}
+
+function isMissingPortableServiceMapRouteError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  if (!message.includes("Kibana 404") && !message.includes("Kibana 400")) {
+    return false;
+  }
+
+  return message.includes("Not Found") || message.toLowerCase().includes("no handler found");
 }
 
 function parseLookbackMs(lookback: string): number {
@@ -935,6 +1612,116 @@ function buildDetailUrls(args: {
   return actions;
 }
 
+function formatPromptList(values: string[]): string {
+  return values.map((value) => `"${value}"`).join(", ");
+}
+
+function buildApmServiceMapPrompt(args: {
+  intent: ServiceMapIntent;
+  rangeFrom: string;
+  rangeTo: string;
+  service?: string;
+  services?: string[];
+  serviceGroupId?: string;
+  environment?: string;
+  kuery?: string;
+  namespace?: string;
+}): string {
+  const parts = [`intent "${args.intent}"`, `range_from "${args.rangeFrom}"`, `range_to "${args.rangeTo}"`];
+
+  if (args.service) {
+    parts.push(`service "${args.service}"`);
+  }
+
+  if (args.services?.length) {
+    parts.push(`services ${formatPromptList(args.services)}`);
+  }
+
+  if (args.serviceGroupId) {
+    parts.push(`service_group_id "${args.serviceGroupId}"`);
+  }
+
+  if (args.environment && args.environment !== ENVIRONMENT_ALL) {
+    parts.push(`environment "${args.environment}"`);
+  }
+
+  if (args.kuery) {
+    parts.push(`kuery "${args.kuery}"`);
+  }
+
+  if (args.namespace) {
+    parts.push(`namespace "${args.namespace}"`);
+  }
+
+  return `Use apm-service-map with ${parts.join(" and ")}`;
+}
+
+function buildRerunPresets(currentLookback: string): string[] {
+  return [...new Set([currentLookback, "15m", "1h", "6h", "24h"])];
+}
+
+function buildNoDataInvestigationActions(args: {
+  intent: ServiceMapIntent;
+  lookback: string;
+  service?: string;
+  services: string[];
+  serviceGroupId?: string;
+  environment: string;
+  kuery: string;
+  namespace?: string;
+}): Array<{ label: string; prompt: string }> {
+  const { intent, lookback, service, services, serviceGroupId, environment, kuery, namespace } = args;
+  const actions: Array<{ label: string; prompt: string }> = [];
+
+  if (lookback !== "24h") {
+    actions.push({
+      label: "Retry with 24h",
+      prompt: buildApmServiceMapPrompt({
+        intent,
+        rangeFrom: "now-24h",
+        rangeTo: "now",
+        service,
+        services,
+        serviceGroupId,
+        environment,
+        kuery,
+        namespace,
+      }),
+    });
+  }
+
+  if (environment !== ENVIRONMENT_ALL) {
+    actions.push({
+      label: "Retry all environments",
+      prompt: buildApmServiceMapPrompt({
+        intent,
+        rangeFrom: `now-${lookback}`,
+        rangeTo: "now",
+        service,
+        services,
+        serviceGroupId,
+        kuery,
+        namespace,
+      }),
+    });
+  }
+
+  if (intent !== "global" || service || services.length > 0 || serviceGroupId || namespace) {
+    actions.push({
+      label: "Show the full map",
+      prompt: buildApmServiceMapPrompt({
+        intent: "global",
+        rangeFrom: `now-${lookback}`,
+        rangeTo: "now",
+        environment,
+        kuery,
+      }),
+    });
+  }
+
+  return actions;
+}
+
 function buildInvestigationActions(args: {
   focusServiceName?: string;
   highlightedServices: string[];
@@ -975,6 +1762,46 @@ function buildInvestigationActions(args: {
   return actions;
 }
 
+function buildSparseTopologyInvestigationActions(args: {
+  focusServiceName?: string;
+  environment: string;
+  kuery: string;
+  namespace?: string;
+}): Array<{ label: string; prompt: string }> {
+  const actions: Array<{ label: string; prompt: string }> = [];
+
+  if (args.focusServiceName) {
+    actions.push({
+      label: `Show current topology for ${args.focusServiceName}`,
+      prompt: buildApmServiceMapPrompt({
+        intent: "service",
+        rangeFrom: "now-24h",
+        rangeTo: "now",
+        service: args.focusServiceName,
+        environment: args.environment,
+        kuery: args.kuery,
+        namespace: args.namespace,
+      }),
+    });
+  }
+
+  if (args.environment !== ENVIRONMENT_ALL) {
+    actions.push({
+      label: "Show current environment map",
+      prompt: buildApmServiceMapPrompt({
+        intent: "global",
+        rangeFrom: "now-24h",
+        rangeTo: "now",
+        environment: args.environment,
+        kuery: args.kuery,
+        namespace: args.namespace,
+      }),
+    });
+  }
+
+  return actions;
+}
+
 export function registerApmServiceMapTool(server: McpServer) {
   registerAppTool(
     server,
@@ -982,20 +1809,25 @@ export function registerApmServiceMapTool(server: McpServer) {
     {
       title: "APM Service Map",
       description:
-        "Requires: Kibana APM service map APIs and Elastic APM data. Returns a Kibana-backed service map that can be rendered inline inside the MCP App, including focused service maps and highlighted investigative scopes like erroring, spiking, or silent services.",
+        'Requires: Kibana APM service map APIs and Elastic APM data. Best RCA entrypoint for topology questions: use intent "erroring" to highlight recently failing services, intent "service" with an exact service.name to focus one service, or intent "global" for the full graph. If the map comes back empty, retry with a wider time range or a looser environment filter.',
       inputSchema: {
         intent: intentSchema.describe(
-          "Optional map mode. Supported values: service, current_context, erroring, spiking, silent, explicit_services, global."
+          'Optional map mode. Use "erroring" for incident triage, "service" when you already know the exact service.name, "explicit_services" for a supplied shortlist, "current_context" for namespace-derived services, and "global" for the full topology.'
         ),
         service: z.string().optional().describe(
-          "Exact APM service.name to focus. Best for 'show the map for checkout' requests."
+          'Exact APM service.name to focus. Pair this with intent "service" for requests like "show me the map for checkout".'
         ),
         services: z
           .array(z.string())
           .optional()
-          .describe("Explicit service.name values to highlight from the current investigation context."),
+          .describe(
+            'Explicit service.name values to highlight from the current investigation context. Best paired with intent "explicit_services".'
+          ),
         service_group_id: z.string().optional().describe("Optional APM service group id."),
-        environment: z.string().optional().describe("Optional service.environment scope."),
+        environment: z
+          .string()
+          .optional()
+          .describe("Optional service.environment scope. Strongly recommended in multi-environment deployments."),
         kuery: z.string().optional().describe(
           "Optional Kibana KQL filter applied to the topology request."
         ),
@@ -1003,7 +1835,7 @@ export function registerApmServiceMapTool(server: McpServer) {
           "Optional namespace or surrounding context hint used to derive services."
         ),
         range_from: z.string().optional().describe(
-          "Start of the time range. Defaults to now-1h. Accepts now-relative values or ISO timestamps."
+          'Start of the time range. Defaults to now-1h. Accepts now-relative values or ISO timestamps. If the map is empty, retrying with something broader like "now-24h" is often the right next step.'
         ),
         range_to: z.string().optional().describe(
           "End of the time range. Defaults to now. Accepts now-relative values or ISO timestamps."
@@ -1069,20 +1901,109 @@ export function registerApmServiceMapTool(server: McpServer) {
         highlightedServiceNames,
       });
 
-      const graph = await kibanaRequest<KibanaPortableServiceMapResponse>(
-        "/internal/apm/service-map/portable",
-        {
-          params: {
-            start: timeWindow.startIso,
-            end: timeWindow.endIso,
-            environment,
-            ...(kuery ? { kuery } : {}),
-            ...(viewState.serviceName ? { serviceName: viewState.serviceName } : {}),
-            ...(viewState.serviceGroupId ? { serviceGroup: viewState.serviceGroupId } : {}),
-            serviceMapState: serializePortableViewState(viewState),
-          },
+      let graph: KibanaPortableServiceMapResponse;
+      let usedStandardRouteFallback = false;
+      let usedRacAlertBadgeFallback = false;
+
+      try {
+        graph = await kibanaRequest<KibanaPortableServiceMapResponse>(
+          "/internal/apm/service-map/portable",
+          {
+            params: {
+              start: timeWindow.startIso,
+              end: timeWindow.endIso,
+              environment,
+              ...(kuery ? { kuery } : {}),
+              ...(viewState.serviceName ? { serviceName: viewState.serviceName } : {}),
+              ...(viewState.serviceGroupId ? { serviceGroup: viewState.serviceGroupId } : {}),
+              serviceMapState: serializePortableViewState(viewState),
+            },
+          }
+        );
+      } catch (error) {
+        if (!isMissingPortableServiceMapRouteError(error)) {
+          throw error;
         }
-      );
+
+        usedStandardRouteFallback = true;
+
+        const standardGraph = await kibanaRequest<KibanaStandardServiceMapResponse>(
+          "/internal/apm/service-map",
+          {
+            params: {
+              start: timeWindow.startIso,
+              end: timeWindow.endIso,
+              environment,
+              ...(kuery ? { kuery } : {}),
+              ...(viewState.serviceName ? { serviceName: viewState.serviceName } : {}),
+              ...(viewState.serviceGroupId ? { serviceGroup: viewState.serviceGroupId } : {}),
+            },
+          }
+        );
+
+        const baseGraph = buildPortableGraphFromRawResponse(standardGraph);
+        const serviceNames = getServiceNamesFromGraph(baseGraph.nodes);
+
+        let badges: ServiceMapBadgeResponse = {
+          alerts: [],
+          slos: [],
+        };
+
+        if (serviceNames.length > 0) {
+          try {
+            badges = await kibanaRequest<ServiceMapBadgeResponse>(
+              "/internal/apm/service-map/service_badges",
+              {
+                method: "POST",
+                params: {
+                  start: timeWindow.startIso,
+                  end: timeWindow.endIso,
+                  environment,
+                  ...(kuery ? { kuery } : {}),
+                },
+                body: {
+                  serviceNames: JSON.stringify(serviceNames),
+                },
+              }
+            );
+          } catch (badgeError) {
+            const message = badgeError instanceof Error ? badgeError.message : String(badgeError);
+            queryErrors.push(`Service-map badges route failed: ${message}`);
+
+            try {
+              badges = await fetchServiceBadgesFromRacAlerts({
+                serviceNames,
+                timeWindow,
+                environment,
+              });
+              usedRacAlertBadgeFallback = true;
+            } catch (racBadgeError) {
+              const racMessage =
+                racBadgeError instanceof Error ? racBadgeError.message : String(racBadgeError);
+              queryErrors.push(`Service-map RAC alert badge fallback failed: ${racMessage}`);
+            }
+          }
+        }
+
+        const nodesWithBadges = mergePortableGraphWithBadges(baseGraph.nodes, badges);
+        const graphWithState = applyPortableGraphState({
+          nodes: nodesWithBadges,
+          edges: baseGraph.edges,
+          viewState: {
+            serviceName: viewState.serviceName,
+            highlightedServiceNames: viewState.highlightedServiceNames,
+            orientation: viewState.orientation,
+            filters: viewState.filters,
+          },
+        });
+
+        graph = {
+          nodes: graphWithState.nodes,
+          edges: graphWithState.edges,
+          nodesCount: baseGraph.nodesCount,
+          tracesCount: baseGraph.tracesCount,
+        };
+      }
 
       const serviceCount = getServiceCount(graph);
       const edgeCount = graph.edges.length;
@@ -1099,7 +2020,101 @@ export function registerApmServiceMapTool(server: McpServer) {
       const summary =
         serviceCount > 0
           ? `Service map${viewState.serviceName ? ` for ${viewState.serviceName}` : ""} with ${serviceCount} service${serviceCount === 1 ? "" : "s"} and ${edgeCount} relationship${edgeCount === 1 ? "" : "s"}.`
-          : `No service map nodes were returned for the requested scope and time range.`;
+          : `No service map nodes were returned for the requested scope and time range. This usually means no matching APM telemetry was found in ${timeWindow.lookback}.`;
+
+      if (serviceCount === 0) {
+        warnings.push(
+          `No APM service-map telemetry matched this scope in ${timeWindow.lookback}. If you expected data, retry with a wider window${environment !== ENVIRONMENT_ALL ? " or without the environment filter" : ""}.`
+        );
+      }
+
+      const hasSparseTopology = serviceCount > 0 && edgeCount === 0 && graph.tracesCount === 0;
+      if (hasSparseTopology) {
+        warnings.push(
+          `The requested window matched ${serviceCount} service${serviceCount === 1 ? "" : "s"}, but no relationship telemetry was available, so the map contains 0 relationships. This commonly happens for older windows after trace-based topology data has aged out.`
+        );
+
+        if (viewState.serviceName) {
+          warnings.push(
+            `Try a current window for "${viewState.serviceName}" to inspect the live neighborhood around the alerted service, then use the historical alert context to reason about likely downstream suspects.`
+          );
+        }
+      }
+
+      if (usedStandardRouteFallback) {
+        warnings.push(
+          "This Kibana cluster does not expose the portable service-map API. The MCP fell back to the standard APM service-map route and applied badges, highlighting, layout, and filters locally."
+        );
+
+        if (usedRacAlertBadgeFallback) {
+          warnings.push(
+            "Alert badges were derived from Kibana alert documents because the APM service-badge route is unavailable on this cluster. SLO badges may be missing in this fallback mode."
+          );
+        }
+      }
+
+      const investigationActions =
+        serviceCount > 0
+          ? [
+              ...(hasSparseTopology
+                ? buildSparseTopologyInvestigationActions({
+                    focusServiceName: viewState.serviceName,
+                    environment,
+                    kuery,
+                    namespace: args.namespace,
+                  })
+                : []),
+              ...buildInvestigationActions({
+                focusServiceName: viewState.serviceName,
+                highlightedServices: viewState.highlightedServiceNames,
+                lookback: timeWindow.lookback,
+                namespace: args.namespace,
+              }),
+            ]
+          : buildNoDataInvestigationActions({
+              intent: effectiveIntent,
+              lookback: timeWindow.lookback,
+              service,
+              services: explicitServices,
+              serviceGroupId,
+              environment,
+              kuery,
+              namespace: args.namespace,
+            });
+
+      const rerunContext = {
+        tool: "apm-service-map",
+        current_lookback: timeWindow.lookback,
+        prompt_template: buildApmServiceMapPrompt({
+          intent: effectiveIntent,
+          rangeFrom: "now-{lookback}",
+          rangeTo: "now",
+          service,
+          services: explicitServices,
+          serviceGroupId,
+          environment,
+          kuery,
+          namespace: args.namespace,
+        }),
+        presets: buildRerunPresets(timeWindow.lookback),
+      };
+
+      let investigationObjects: InvestigationObject[] | undefined;
+      try {
+        investigationObjects = await buildInvestigationObjects({
+          graph,
+          timeWindow,
+          environment,
+          kuery,
+          serviceGroupId,
+        });
+      } catch (investigationObjectError) {
+        const message =
+          investigationObjectError instanceof Error
+            ? investigationObjectError.message
+            : String(investigationObjectError);
+        queryErrors.push(`Investigation-object derivation failed: ${message}`);
+      }
 
       const result: Record<string, unknown> = {
         summary,
@@ -1126,13 +2141,13 @@ export function registerApmServiceMapTool(server: McpServer) {
           edge_count: edgeCount,
           full_map_url: fullMapUrl,
         },
-        investigation_actions: buildInvestigationActions({
-          focusServiceName: viewState.serviceName,
-          highlightedServices: viewState.highlightedServiceNames,
-          lookback: timeWindow.lookback,
-          namespace: args.namespace,
-        }),
+        investigation_actions: investigationActions,
+        rerun_context: rerunContext,
       };
+
+      if (investigationObjects?.length) {
+        result.investigation_objects = investigationObjects;
+      }
 
       if (namespaceNote) {
         result.namespace_note = namespaceNote;

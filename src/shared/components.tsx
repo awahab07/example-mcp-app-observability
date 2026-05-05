@@ -36,7 +36,7 @@ const badgeColors: Record<BadgeTone, { bg: string; fg: string; border: string }>
   major: { bg: `${SEV_MAJOR}20`, fg: SEV_MAJOR, border: `${SEV_MAJOR}66` },
   minor: { bg: `${SEV_MINOR}20`, fg: SEV_MINOR, border: `${SEV_MINOR}66` },
   ok: { bg: `${theme.green}18`, fg: theme.greenSoft, border: `${theme.green}55` },
-  info: { bg: `${theme.blue}18`, fg: theme.blue, border: `${theme.blue}55` },
+  info: { bg: `${theme.blue}18`, fg: theme.text, border: `${theme.blue}55` },
   neutral: { bg: `${theme.borderStrong}`, fg: theme.textMuted, border: theme.border },
 };
 
