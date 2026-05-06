@@ -34,9 +34,13 @@ const DEFAULT_RANGE_TO = "now";
 const DEFAULT_ORIENTATION = "horizontal";
 const MAX_HIGHLIGHTED_SERVICES = 12;
 const MAX_INVESTIGATION_OBJECTS = 8;
+const MAX_RCA_CANDIDATES = 6;
 const MAX_RELATED_CLUSTERS = 2;
 const MAX_RELATED_ALERT_HITS = 40;
 const MAX_SERVICE_NAMES_FOR_RAC = 120;
+const RCA_MIN_FAILURES = 2;
+const RCA_MIN_FAILURE_RATE = 0.5;
+const RCA_STRONG_FAILURE_RATE = 0.9;
 const MINUTE_MS = 60_000;
 const HOUR_MS = 60 * MINUTE_MS;
 const DAY_MS = 24 * HOUR_MS;
@@ -93,6 +97,8 @@ interface PortableServiceMapViewState {
 
 interface ServiceMapToolArgs {
   intent?: ServiceMapIntent;
+  alert_id?: string;
+  alert_url?: string;
   service?: string;
   services?: string[];
   service_group_id?: string;
@@ -115,6 +121,8 @@ interface TimeWindow {
 
 type InvestigationObjectKind = "alert" | "slo";
 type InvestigationObjectTone = "critical" | "warning" | "info" | "neutral";
+type ServiceMapRcaCandidateKind = "edge" | "service";
+type ServiceMapRcaTone = "critical" | "warning";
 
 type RacAlertFilterClause =
   | { terms: { "service.name": string[] } }
@@ -158,6 +166,82 @@ interface InvestigationObject {
   serviceName?: string;
   clusterName?: string;
   kibanaUrl?: string;
+}
+
+interface AlertContext {
+  id: string;
+  url?: string;
+  ruleName?: string;
+  reason?: string;
+  status?: string;
+  serviceName?: string;
+  environment?: string;
+  transactionType?: string;
+  transactionName?: string;
+  timestamp?: string;
+  start?: string;
+  end?: string;
+  rangeFrom?: string;
+  rangeTo?: string;
+}
+
+interface AlertContextRow {
+  "@timestamp"?: string;
+  "kibana.alert.uuid"?: string;
+  "kibana.alert.rule.name"?: string;
+  "kibana.alert.reason"?: string;
+  "kibana.alert.status"?: string;
+  "kibana.alert.start"?: string;
+  "kibana.alert.end"?: string;
+  "service.name"?: string;
+  "service.environment"?: string;
+  "transaction.type"?: string;
+  "transaction.name"?: string;
+}
+
+interface ServiceMapRcaCandidate {
+  id: string;
+  kind: ServiceMapRcaCandidateKind;
+  title: string;
+  subtitle: string;
+  summary: string;
+  shortLabel: string;
+  tone: ServiceMapRcaTone;
+  score: number;
+  focusServiceName?: string;
+  highlightedServiceNames: string[];
+  selectedElement: PortableServiceMapSelectedElement;
+  kibanaUrl: string;
+  serviceName?: string;
+  targetLabel?: string;
+  transactionName?: string;
+  failures: number;
+  total: number;
+  failureRate: number;
+  avgLatencyMs?: number;
+  p95LatencyMs?: number;
+}
+
+interface ServiceMapRcaSpanRow {
+  "service.name"?: string;
+  "span.destination.service.resource"?: string;
+  "span.type"?: string;
+  "span.subtype"?: string;
+  total?: number;
+  failures?: number;
+  failure_rate?: number;
+  avg_ms?: number;
+  p95_ms?: number;
+}
+
+interface ServiceMapRcaTransactionRow {
+  "service.name"?: string;
+  "transaction.name"?: string;
+  total?: number;
+  failures?: number;
+  failure_rate?: number;
+  avg_ms?: number;
+  p95_ms?: number;
 }
 
 interface RacAlertHitSource {
@@ -370,12 +454,102 @@ function escapeEsql(value: string): string {
   return value.replace(/"/g, '\\"');
 }
 
+function buildEsqlStringList(values: string[]): string {
+  return values.map((value) => `"${escapeEsql(value)}"`).join(", ");
+}
+
 function normalizeServiceNames(services?: string[]): string[] {
   if (!services?.length) {
     return [];
   }
 
   return [...new Set(services.map((service) => service.trim()).filter(Boolean))];
+}
+
+function parseAlertIdFromUrl(alertUrl: string | undefined): string | undefined {
+  const trimmed = alertUrl?.trim();
+  if (!trimmed) {
+    return undefined;
+  }
+
+  try {
+    const url = new URL(trimmed);
+    const match = url.pathname.match(/\/alerts\/([^/?#]+)/);
+    return match?.[1] ? decodeURIComponent(match[1]) : undefined;
+  } catch {
+    const match = trimmed.match(/\/alerts\/([^/?#\s]+)/);
+    return match?.[1] ? decodeURIComponent(match[1]) : undefined;
+  }
+}
+
+function resolveAlertTimeRange(row: AlertContextRow): { rangeFrom?: string; rangeTo?: string } {
+  const rangeFrom = row["kibana.alert.start"];
+  const explicitRangeTo = row["kibana.alert.end"];
+  if (rangeFrom && explicitRangeTo) {
+    return { rangeFrom, rangeTo: explicitRangeTo };
+  }
+
+  if (rangeFrom) {
+    return { rangeFrom, rangeTo: "now" };
+  }
+
+  const timestampMs = row["@timestamp"] ? Date.parse(row["@timestamp"]) : Number.NaN;
+  if (!Number.isFinite(timestampMs)) {
+    return {};
+  }
+
+  return {
+    rangeFrom: new Date(timestampMs - 15 * MINUTE_MS).toISOString(),
+    rangeTo: row["@timestamp"],
+  };
+}
+
+async function fetchAlertContext(args: {
+  alertId?: string;
+  alertUrl?: string;
+  errors: string[];
+}): Promise<AlertContext | undefined> {
+  const id = args.alertId?.trim() || parseAlertIdFromUrl(args.alertUrl);
+  if (!id) {
+    return undefined;
+  }
+
+  const rows = await safeEsqlRows<AlertContextRow>(
+    `
+FROM .alerts-observability*
+| WHERE kibana.alert.uuid == "${escapeEsql(id)}"
+| KEEP @timestamp, kibana.alert.uuid, kibana.alert.rule.name, kibana.alert.reason, kibana.alert.status, kibana.alert.start, kibana.alert.end, service.name, service.environment, transaction.type, transaction.name
+| SORT @timestamp DESC
+| LIMIT 1
+`,
+    args.errors
+  );
+  const row = rows[0];
+  if (!row) {
+    args.errors.push(`No observability alert document was found for alert id '${id}'.`);
+    return {
+      id,
+      url: args.alertUrl?.trim(),
+    };
+  }
+
+  const { rangeFrom, rangeTo } = resolveAlertTimeRange(row);
+  return {
+    id,
+    url: args.alertUrl?.trim(),
+    ruleName: row["kibana.alert.rule.name"],
+    reason: row["kibana.alert.reason"],
+    status: row["kibana.alert.status"],
+    serviceName: row["service.name"],
+    environment: row["service.environment"],
+    transactionType: row["transaction.type"],
+    transactionName: row["transaction.name"],
+    timestamp: row["@timestamp"],
+    start: row["kibana.alert.start"],
+    end: row["kibana.alert.end"],
+    rangeFrom,
+    rangeTo,
+  };
 }
 
 function normalizeAlertField(value: string | string[] | undefined): string | undefined {
@@ -1119,12 +1293,354 @@ function buildKibanaServiceMapUrl(args: {
   return `${config.kibanaUrl}/app/apm#${hashPath}?${searchParams.toString()}`;
 }
 
+function getNodeLabel(node: KibanaServiceMapNode | undefined): string | undefined {
+  if (!node) {
+    return undefined;
+  }
+
+  return String(node.data.label ?? node.id);
+}
+
+function getEdgeSourceServiceName(
+  edge: KibanaServiceMapEdge,
+  nodeById: Map<string, KibanaServiceMapNode>
+): string | undefined {
+  const sourceNode = nodeById.get(edge.source);
+  if (!sourceNode?.data.isService) {
+    return undefined;
+  }
+
+  return getNodeLabel(sourceNode);
+}
+
+function getEdgeTargetLabel(
+  edge: KibanaServiceMapEdge,
+  nodeById: Map<string, KibanaServiceMapNode>
+): string | undefined {
+  return getNodeLabel(nodeById.get(edge.target));
+}
+
+function edgeMatchesDestination(args: {
+  edge: KibanaServiceMapEdge;
+  nodeById: Map<string, KibanaServiceMapNode>;
+  serviceName: string;
+  resource: string;
+}): boolean {
+  const sourceServiceName = getEdgeSourceServiceName(args.edge, args.nodeById);
+  if (sourceServiceName !== args.serviceName) {
+    return false;
+  }
+
+  const targetLabel = getEdgeTargetLabel(args.edge, args.nodeById);
+  return (
+    targetLabel === args.resource ||
+    args.edge.data?.resources?.includes(args.resource) === true ||
+    args.edge.target === `>${args.resource}`
+  );
+}
+
+function shouldIncludeRcaCandidate(failures: number, failureRate: number): boolean {
+  if (failures <= 0) {
+    return false;
+  }
+
+  return (
+    (failures >= RCA_MIN_FAILURES && failureRate >= RCA_MIN_FAILURE_RATE) ||
+    failureRate >= RCA_STRONG_FAILURE_RATE
+  );
+}
+
+function formatFailureRatePercent(failureRate: number): string {
+  return `${(failureRate * 100).toFixed(failureRate >= 0.1 ? 0 : 1)}%`;
+}
+
+function formatLatencyMs(value: number | undefined): string | undefined {
+  if (value == null || Number.isNaN(value)) {
+    return undefined;
+  }
+
+  if (value >= 1000) {
+    return `${(value / 1000).toFixed(1)}s`;
+  }
+
+  return `${value.toFixed(0)}ms`;
+}
+
+function buildRcaCandidateUrl(args: {
+  timeWindow: TimeWindow;
+  environment: string;
+  kuery: string;
+  serviceGroupId?: string;
+  focusServiceName?: string;
+  highlightedServiceNames: string[];
+  selectedElement: PortableServiceMapSelectedElement;
+}): string {
+  const viewState = normalizePortableViewState({
+    rangeFrom: args.timeWindow.rangeFrom,
+    rangeTo: args.timeWindow.rangeTo,
+    environment: args.environment,
+    kuery: args.kuery,
+    serviceName: args.focusServiceName,
+    serviceGroupId: args.serviceGroupId,
+    highlightedServiceNames: args.highlightedServiceNames,
+    selectedElement: args.selectedElement,
+  });
+
+  return buildKibanaServiceMapUrl({
+    rangeFrom: args.timeWindow.rangeFrom,
+    rangeTo: args.timeWindow.rangeTo,
+    environment: args.environment,
+    kuery: args.kuery,
+    serviceName: args.focusServiceName,
+    serviceGroupId: args.serviceGroupId,
+    serviceMapState: viewState,
+  });
+}
+
+async function buildRcaCandidates(args: {
+  graph: KibanaPortableServiceMapResponse;
+  timeWindow: TimeWindow;
+  environment: string;
+  kuery: string;
+  serviceGroupId?: string;
+  alertContext?: AlertContext;
+  errors: string[];
+}): Promise<ServiceMapRcaCandidate[]> {
+  const serviceNames = normalizeServiceNames(
+    args.graph.nodes
+      .filter((node) => node.data.isService)
+      .map((node) => String(node.data.label ?? node.id))
+  ).slice(0, MAX_SERVICE_NAMES_FOR_RAC);
+  if (serviceNames.length === 0) {
+    return [];
+  }
+
+  const nodeById = new Map(args.graph.nodes.map((node) => [node.id, node] as const));
+  const serviceFilter = `\n  AND service.name IN (${buildEsqlStringList(serviceNames)})`;
+  const spanRows = await safeEsqlRows<ServiceMapRcaSpanRow>(
+    `
+FROM traces-apm*,traces-*.otel-*
+| WHERE ${buildTimestampClause(args.timeWindow)}
+  AND processor.event == "span"
+  AND span.destination.service.resource IS NOT NULL${serviceFilter}${buildEnvironmentClause(args.environment)}
+| EVAL duration_ms = span.duration.us / 1000
+| STATS
+    total = COUNT(*),
+    failures = COUNT(*) WHERE event.outcome == "failure",
+    avg_ms = AVG(duration_ms),
+    p95_ms = PERCENTILE(duration_ms, 95)
+  BY service.name, span.destination.service.resource, span.type, span.subtype
+| EVAL failure_rate = CASE(total > 0, TO_DOUBLE(failures) / TO_DOUBLE(total), 0.0)
+| WHERE failures > 0
+| SORT failure_rate DESC, failures DESC, total DESC
+| LIMIT 50
+`,
+    args.errors
+  );
+
+  const transactionRows = await safeEsqlRows<ServiceMapRcaTransactionRow>(
+    `
+FROM traces-apm*,traces-*.otel-*
+| WHERE ${buildTimestampClause(args.timeWindow)}
+  AND processor.event == "transaction"
+  AND transaction.name IS NOT NULL${serviceFilter}${buildEnvironmentClause(args.environment)}
+| EVAL duration_ms = transaction.duration.us / 1000
+| STATS
+    total = COUNT(*),
+    failures = COUNT(*) WHERE event.outcome == "failure",
+    avg_ms = AVG(duration_ms),
+    p95_ms = PERCENTILE(duration_ms, 95)
+  BY service.name, transaction.name
+| EVAL failure_rate = CASE(total > 0, TO_DOUBLE(failures) / TO_DOUBLE(total), 0.0)
+| WHERE failures > 0
+| SORT failure_rate DESC, failures DESC, total DESC
+| LIMIT 50
+`,
+    args.errors
+  );
+
+  const candidates: ServiceMapRcaCandidate[] = [];
+
+  for (const row of spanRows) {
+    const serviceName = row["service.name"]?.trim();
+    const resource = row["span.destination.service.resource"]?.trim();
+    const failures = row.failures ?? 0;
+    const total = row.total ?? 0;
+    const failureRate = row.failure_rate ?? 0;
+    if (!serviceName || !resource || !shouldIncludeRcaCandidate(failures, failureRate)) {
+      continue;
+    }
+
+    const edge = args.graph.edges.find((candidateEdge) =>
+      edgeMatchesDestination({
+        edge: candidateEdge,
+        nodeById,
+        serviceName,
+        resource,
+      })
+    );
+    if (!edge) {
+      continue;
+    }
+
+    const targetNode = nodeById.get(edge.target);
+    const targetLabel = getEdgeTargetLabel(edge, nodeById) ?? resource;
+    const highlightedServiceNames = normalizeServiceNames([
+      serviceName,
+      targetNode?.data.isService ? getNodeLabel(targetNode) ?? "" : "",
+    ]);
+    const selectedElement: PortableServiceMapSelectedElement = {
+      kind: "edge",
+      edgeId: edge.id,
+      source: edge.source,
+      target: edge.target,
+    };
+    const failureRateText = formatFailureRatePercent(failureRate);
+    const avgLatency = formatLatencyMs(row.avg_ms);
+    const score = 900 + failureRate * 500 + Math.min(failures, 500) + (total >= 20 ? 40 : 0);
+
+    candidates.push({
+      id: `edge:${edge.id}`,
+      kind: "edge",
+      title: `${serviceName} → ${targetLabel}`,
+      subtitle: `${failureRateText} failing · ${failures}/${total} spans`,
+      summary: [
+        `The ${serviceName} to ${targetLabel} dependency is failing ${failureRateText} of spans in this window.`,
+        avgLatency ? `Average span latency is ${avgLatency}.` : undefined,
+        args.alertContext?.reason ? `Originating alert: ${args.alertContext.reason}` : undefined,
+      ]
+        .filter(Boolean)
+        .join(" "),
+      shortLabel: "RC",
+      tone: failureRate >= RCA_STRONG_FAILURE_RATE ? "critical" : "warning",
+      score,
+      focusServiceName: serviceName,
+      highlightedServiceNames,
+      selectedElement,
+      kibanaUrl: buildRcaCandidateUrl({
+        timeWindow: args.timeWindow,
+        environment: args.environment,
+        kuery: args.kuery,
+        serviceGroupId: args.serviceGroupId,
+        focusServiceName: serviceName,
+        highlightedServiceNames,
+        selectedElement,
+      }),
+      serviceName,
+      targetLabel,
+      failures,
+      total,
+      failureRate,
+      avgLatencyMs: row.avg_ms,
+      p95LatencyMs: row.p95_ms,
+    });
+  }
+
+  const serviceNodeByName = new Map(
+    args.graph.nodes
+      .filter((node) => node.data.isService)
+      .map((node) => [String(node.data.label ?? node.id), node] as const)
+  );
+
+  for (const row of transactionRows) {
+    const serviceName = row["service.name"]?.trim();
+    const transactionName = row["transaction.name"]?.trim();
+    const failures = row.failures ?? 0;
+    const total = row.total ?? 0;
+    const failureRate = row.failure_rate ?? 0;
+    const serviceNode = serviceName ? serviceNodeByName.get(serviceName) : undefined;
+    if (
+      !serviceName ||
+      !transactionName ||
+      !serviceNode ||
+      !shouldIncludeRcaCandidate(failures, failureRate)
+    ) {
+      continue;
+    }
+
+    const selectedElement: PortableServiceMapSelectedElement = {
+      kind: "node",
+      nodeId: serviceNode.id,
+    };
+    const highlightedServiceNames = normalizeServiceNames([serviceName]);
+    const failureRateText = formatFailureRatePercent(failureRate);
+    const p95Latency = formatLatencyMs(row.p95_ms);
+    const alertTransactionBoost =
+      args.alertContext?.serviceName === serviceName &&
+      args.alertContext?.transactionName === transactionName
+        ? 120
+        : 0;
+    const score =
+      650 + alertTransactionBoost + failureRate * 350 + Math.min(failures, 300) + (total >= 20 ? 30 : 0);
+
+    candidates.push({
+      id: `service:${serviceName}:${transactionName}`,
+      kind: "service",
+      title: serviceName,
+      subtitle: `${failureRateText} failing · ${transactionName}`,
+      summary: [
+        `${transactionName} on ${serviceName} is failing ${failureRateText} of transactions (${failures}/${total}).`,
+        p95Latency ? `p95 latency is ${p95Latency}.` : undefined,
+        args.alertContext?.reason ? `Originating alert: ${args.alertContext.reason}` : undefined,
+      ]
+        .filter(Boolean)
+        .join(" "),
+      shortLabel: "RS",
+      tone: failureRate >= RCA_STRONG_FAILURE_RATE ? "critical" : "warning",
+      score,
+      focusServiceName: serviceName,
+      highlightedServiceNames,
+      selectedElement,
+      kibanaUrl: buildRcaCandidateUrl({
+        timeWindow: args.timeWindow,
+        environment: args.environment,
+        kuery: args.kuery,
+        serviceGroupId: args.serviceGroupId,
+        focusServiceName: serviceName,
+        highlightedServiceNames,
+        selectedElement,
+      }),
+      serviceName,
+      transactionName,
+      failures,
+      total,
+      failureRate,
+      avgLatencyMs: row.avg_ms,
+      p95LatencyMs: row.p95_ms,
+    });
+  }
+
+  const rankedCandidates = candidates.sort(
+    (left, right) => right.score - left.score || left.title.localeCompare(right.title)
+  );
+  const alertServiceName = args.alertContext?.serviceName?.trim();
+  if (!alertServiceName) {
+    return rankedCandidates.slice(0, MAX_RCA_CANDIDATES);
+  }
+
+  const alertServiceCandidates = rankedCandidates.filter(
+    (candidate) =>
+      candidate.serviceName === alertServiceName ||
+      candidate.highlightedServiceNames.includes(alertServiceName)
+  );
+  if (alertServiceCandidates.length === 0) {
+    return rankedCandidates.slice(0, MAX_RCA_CANDIDATES);
+  }
+
+  const alertCandidateIds = new Set(alertServiceCandidates.map((candidate) => candidate.id));
+  return [
+    ...alertServiceCandidates,
+    ...rankedCandidates.filter((candidate) => !alertCandidateIds.has(candidate.id)),
+  ].slice(0, MAX_RCA_CANDIDATES);
+}
+
 function getServiceCount(graph: KibanaPortableServiceMapResponse): number {
   return graph.nodes.filter((node) => node.data.isService).length;
 }
 
 function buildRequestContext(args: {
   intent: ServiceMapIntent;
+  alertContext?: AlertContext;
   service?: string;
   services: string[];
   serviceGroupId?: string;
@@ -1137,6 +1653,7 @@ function buildRequestContext(args: {
 }): Record<string, unknown> {
   const {
     intent,
+    alertContext,
     service,
     services,
     serviceGroupId,
@@ -1154,6 +1671,15 @@ function buildRequestContext(args: {
     range_to: timeWindow.rangeTo,
     environment,
     kuery,
+    ...(alertContext
+      ? {
+          alert_id: alertContext.id,
+          ...(alertContext.url ? { alert_url: alertContext.url } : {}),
+          ...(alertContext.ruleName ? { alert_rule: alertContext.ruleName } : {}),
+          ...(alertContext.status ? { alert_status: alertContext.status } : {}),
+          ...(alertContext.reason ? { alert_reason: alertContext.reason } : {}),
+        }
+      : {}),
     ...(service ? { service } : {}),
     ...(services.length ? { services } : {}),
     ...(serviceGroupId ? { service_group_id: serviceGroupId } : {}),
@@ -1814,6 +2340,12 @@ export function registerApmServiceMapTool(server: McpServer) {
         intent: intentSchema.describe(
           'Optional map mode. Use "erroring" for incident triage, "service" when you already know the exact service.name, "explicit_services" for a supplied shortlist, "current_context" for namespace-derived services, and "global" for the full topology.'
         ),
+        alert_id: z.string().optional().describe(
+          "Optional Kibana alert UUID. When supplied, the tool looks up the alert document, derives the affected service, environment, and alert window, and ranks RCA candidates for that topology."
+        ),
+        alert_url: z.string().optional().describe(
+          "Optional Kibana Observability alert URL. The alert UUID is extracted from the URL and handled like alert_id."
+        ),
         service: z.string().optional().describe(
           'Exact APM service.name to focus. Pair this with intent "service" for requests like "show me the map for checkout".'
         ),
@@ -1845,11 +2377,21 @@ export function registerApmServiceMapTool(server: McpServer) {
     },
     async (rawArgs) => {
       const args = rawArgs as ServiceMapToolArgs;
-      const timeWindow = resolveTimeWindow(args.range_from, args.range_to);
-      const environment = args.environment?.trim() || ENVIRONMENT_ALL;
+      const queryErrors: string[] = [];
+      const warnings: string[] = [];
+      const alertContext = await fetchAlertContext({
+        alertId: args.alert_id,
+        alertUrl: args.alert_url,
+        errors: queryErrors,
+      });
+      const timeWindow = resolveTimeWindow(
+        args.range_from ?? alertContext?.rangeFrom,
+        args.range_to ?? alertContext?.rangeTo
+      );
+      const environment = args.environment?.trim() || alertContext?.environment || ENVIRONMENT_ALL;
       const kuery = args.kuery?.trim() || "";
       const explicitServices = normalizeServiceNames(args.services);
-      const service = args.service?.trim();
+      const service = args.service?.trim() || alertContext?.serviceName?.trim();
       const serviceGroupId = args.service_group_id?.trim();
       const effectiveIntent = defaultIntent({
         intent: args.intent,
@@ -1858,12 +2400,15 @@ export function registerApmServiceMapTool(server: McpServer) {
         namespace: args.namespace,
       });
 
-      const queryErrors: string[] = [];
-      const warnings: string[] = [];
-
       if (kuery) {
         warnings.push(
           "Derived service highlighting is based on direct telemetry queries and does not yet re-apply the supplied KQL when choosing highlighted services."
+        );
+      }
+
+      if (alertContext?.id && alertContext.serviceName) {
+        warnings.push(
+          `Alert ${alertContext.id} resolved to service "${alertContext.serviceName}"${alertContext.transactionName ? ` and transaction "${alertContext.transactionName}"` : ""}. The map is scoped to the alert window unless an explicit time range was provided.`
         );
       }
 
@@ -1891,7 +2436,7 @@ export function registerApmServiceMapTool(server: McpServer) {
           ? [focusServiceName]
           : scopedServices;
 
-      const viewState = normalizePortableViewState({
+      let viewState = normalizePortableViewState({
         rangeFrom: timeWindow.rangeFrom,
         rangeTo: timeWindow.rangeTo,
         environment,
@@ -2003,6 +2548,39 @@ export function registerApmServiceMapTool(server: McpServer) {
           nodesCount: baseGraph.nodesCount,
           tracesCount: baseGraph.tracesCount,
         };
+      }
+
+      let rcaCandidates: ServiceMapRcaCandidate[] | undefined;
+      try {
+        rcaCandidates = await buildRcaCandidates({
+          graph,
+          timeWindow,
+          environment,
+          kuery,
+          serviceGroupId,
+          alertContext,
+          errors: queryErrors,
+        });
+      } catch (rcaError) {
+        const message = rcaError instanceof Error ? rcaError.message : String(rcaError);
+        queryErrors.push(`RCA candidate derivation failed: ${message}`);
+      }
+
+      const primaryRcaCandidate = rcaCandidates?.[0];
+      if (primaryRcaCandidate) {
+        viewState = normalizePortableViewState({
+          rangeFrom: timeWindow.rangeFrom,
+          rangeTo: timeWindow.rangeTo,
+          environment,
+          kuery,
+          serviceName: primaryRcaCandidate.focusServiceName || viewState.serviceName,
+          serviceGroupId,
+          highlightedServiceNames: normalizeServiceNames([
+            ...viewState.highlightedServiceNames,
+            ...primaryRcaCandidate.highlightedServiceNames,
+          ]),
+          selectedElement: primaryRcaCandidate.selectedElement,
+        });
       }
 
       const serviceCount = getServiceCount(graph);
@@ -2120,6 +2698,7 @@ export function registerApmServiceMapTool(server: McpServer) {
         summary,
         request_context: buildRequestContext({
           intent: effectiveIntent,
+          alertContext,
           service,
           services: explicitServices,
           serviceGroupId,
@@ -2144,6 +2723,14 @@ export function registerApmServiceMapTool(server: McpServer) {
         investigation_actions: investigationActions,
         rerun_context: rerunContext,
       };
+
+      if (alertContext) {
+        result.alert_context = alertContext;
+      }
+
+      if (rcaCandidates?.length) {
+        result.rca_candidates = rcaCandidates;
+      }
 
       if (investigationObjects?.length) {
         result.investigation_objects = investigationObjects;

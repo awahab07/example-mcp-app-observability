@@ -6,22 +6,72 @@
  */
 
 import type { Edge, Node, Viewport } from '@xyflow/react';
-import type {
-  PortableServiceMapEdgeData,
-  PortableServiceMapNodeData,
-  PortableServiceMapSelectedElement,
-  PortableServiceMapViewport,
-} from '@kibana-apm-service-map-state';
+
+export interface PortableServiceMapViewport {
+  x: number;
+  y: number;
+  zoom: number;
+}
+
+export type PortableServiceMapSelectedElement =
+  | {
+      kind: 'node';
+      nodeId: string;
+    }
+  | {
+      kind: 'edge';
+      edgeId?: string;
+      source?: string;
+      target?: string;
+    };
+
+export interface PortableServiceMapNodeData extends Record<string, unknown> {
+  id: string;
+  label: string;
+  isService: boolean;
+  isGrouped?: boolean;
+  count?: number;
+  groupedConnections?: Array<{
+    id: string;
+    label: string;
+    spanType?: string;
+    spanSubtype?: string;
+  }>;
+  spanType?: string;
+  spanSubtype?: string;
+  contextHighlight?: boolean;
+  agentName?: string;
+  alertsCount?: number;
+  alertsByStatus?: Partial<Record<'active' | 'recovered' | 'untracked' | 'delayed', number>>;
+  sloStatus?: string;
+  sloCount?: number;
+  serviceAnomalyStats?: {
+    healthStatus?: string;
+  };
+}
+
+export interface PortableServiceMapEdgeData extends Record<string, unknown> {
+  isBidirectional?: boolean;
+  isGrouped?: boolean;
+  sourceLabel?: string;
+  targetLabel?: string;
+  resources?: string[];
+  sourceData?: {
+    serviceName?: string;
+    agentName?: string;
+    serviceEnvironment?: string;
+  };
+  targetData?: {
+    serviceName?: string;
+    spanDestinationServiceResource?: string;
+    spanType?: string;
+    spanSubtype?: string;
+    label?: string;
+  };
+}
 
 export type ServiceMapNode = Node<PortableServiceMapNodeData>;
 export type ServiceMapEdge = Edge<PortableServiceMapEdgeData>;
-
-export type {
-  PortableServiceMapEdgeData,
-  PortableServiceMapNodeData,
-  PortableServiceMapSelectedElement,
-  PortableServiceMapViewport,
-};
 
 export function isServiceMapServiceNode(
   node: ServiceMapNode

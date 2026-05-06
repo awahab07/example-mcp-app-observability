@@ -97,6 +97,22 @@ function getNormalizedSloStatusForMapFilters(data: PortableServiceMapNodeData): 
   return 'noData';
 }
 
+function getNormalizedAnomalyStatusForMapFilters(
+  data: PortableServiceMapNodeData
+): ServiceMapAnomalyStatus {
+  const healthStatus = data.serviceAnomalyStats?.healthStatus;
+  if (
+    healthStatus === 'healthy' ||
+    healthStatus === 'warning' ||
+    healthStatus === 'critical' ||
+    healthStatus === 'unknown'
+  ) {
+    return healthStatus;
+  }
+
+  return 'unknown';
+}
+
 function getServiceNodeAlertCountForStatus(
   data: PortableServiceMapNodeData,
   status: ServiceMapAlertStatus
@@ -134,15 +150,7 @@ function serviceMatchesFilters(data: PortableServiceMapNodeData, filters: Servic
   }
 
   if (filters.anomalyStatusFilter.length > 0) {
-    const healthStatus = data.serviceAnomalyStats?.healthStatus ?? 'unknown';
-    if (
-      healthStatus !== 'healthy' &&
-      healthStatus !== 'warning' &&
-      healthStatus !== 'critical' &&
-      healthStatus !== 'unknown'
-    ) {
-      return false;
-    }
+    const healthStatus = getNormalizedAnomalyStatusForMapFilters(data);
     if (!filters.anomalyStatusFilter.includes(healthStatus)) {
       return false;
     }
@@ -432,15 +440,7 @@ export function computeServiceMapFilterOptionCounts(
 
     counts.slo[getNormalizedSloStatusForMapFilters(node.data)] += 1;
 
-    const anomalyStatus = node.data.serviceAnomalyStats?.healthStatus ?? 'unknown';
-    if (
-      anomalyStatus === 'healthy' ||
-      anomalyStatus === 'warning' ||
-      anomalyStatus === 'critical' ||
-      anomalyStatus === 'unknown'
-    ) {
-      counts.anomaly[anomalyStatus] += 1;
-    }
+    counts.anomaly[getNormalizedAnomalyStatusForMapFilters(node.data)] += 1;
   }
 
   return counts;

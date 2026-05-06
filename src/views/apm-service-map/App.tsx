@@ -26,6 +26,7 @@ import type {
   ServiceMapEdge,
   ServiceMapNode,
 } from "./local_portable_types";
+import { serviceMapSelectedElementsEqual } from "./local_portable_types";
 import {
   ALERT_STATUS_OPTIONS,
   ANOMALY_STATUS_OPTIONS,
@@ -99,6 +100,7 @@ interface ToolData {
   };
   investigation_actions?: InvestigationAction[];
   investigation_objects?: InvestigationObject[];
+  rca_candidates?: RcaCandidate[];
   rerun_context?: RerunContext;
   warnings?: string[];
   namespace_note?: string;
@@ -129,6 +131,27 @@ interface DetailData {
 
 type StripItemTone = "critical" | "warning" | "info" | "neutral";
 
+interface RcaCandidate {
+  id: string;
+  kind: "edge" | "service";
+  title: string;
+  subtitle: string;
+  summary: string;
+  shortLabel: string;
+  tone: "critical" | "warning";
+  score: number;
+  focusServiceName?: string;
+  highlightedServiceNames: string[];
+  selectedElement: PortableServiceMapSelectedElement;
+  kibanaUrl: string;
+  serviceName?: string;
+  targetLabel?: string;
+  transactionName?: string;
+  failures: number;
+  total: number;
+  failureRate: number;
+}
+
 interface InvestigationObject {
   id: string;
   kind: "alert" | "slo";
@@ -149,7 +172,7 @@ interface InvestigationObject {
 
 interface InvestigationStripItem {
   id: string;
-  kind: "filter" | "service" | "resource" | "object";
+  kind: "filter" | "service" | "resource" | "object" | "rca";
   title: string;
   subtitle: string;
   shortLabel: string;
@@ -160,6 +183,7 @@ interface InvestigationStripItem {
   filterKind?: "alert" | "slo" | "anomaly";
   filterValue?: ServiceMapAlertStatus | ServiceMapSloStatus | ServiceMapAnomalyStatus;
   investigationObject?: InvestigationObject;
+  rcaCandidate?: RcaCandidate;
   score: number;
 }
 
@@ -983,6 +1007,90 @@ export function App() {
     [clearGraphSelection, renderedGraph?.nodes, viewState?.selectedElement]
   );
 
+  const focusGraphEdge = useCallback(
+    (selectedElement: PortableServiceMapSelectedElement) => {
+      if (selectedElement.kind !== "edge") {
+        return;
+      }
+
+      const targetEdge = renderedGraph?.edges.find((edge) => {
+        if (selectedElement.edgeId && edge.id === selectedElement.edgeId && !edge.hidden) {
+          return true;
+        }
+
+        return Boolean(
+          selectedElement.source &&
+            selectedElement.target &&
+            edge.source === selectedElement.source &&
+            edge.target === selectedElement.target &&
+            !edge.hidden
+        );
+      });
+
+      if (targetEdge) {
+        setSelectedEdge(targetEdge);
+        setSelectedNode(undefined);
+        setDetail(null);
+        setDetailError(null);
+        focusNonceRef.current += 1;
+        setFocusRequest({
+          nodeId: targetEdge.source,
+          nonce: focusNonceRef.current,
+        });
+      } else {
+        clearGraphSelection();
+        return;
+      }
+
+      setViewState((current) =>
+        clearableViewStateUpdate(current, {
+          selectedElement,
+        })
+      );
+    },
+    [clearGraphSelection, renderedGraph?.edges]
+  );
+
+  const focusRcaCandidate = useCallback(
+    (candidate: RcaCandidate) => {
+      if (!viewState) {
+        return;
+      }
+
+      const activeId = `rca:${candidate.id}`;
+      setActiveInvestigationObjectId(activeId);
+      setViewState((current) => {
+        if (!current) {
+          return current;
+        }
+
+        return clearableViewStateUpdate(current, {
+          serviceName: candidate.focusServiceName || current.serviceName,
+          highlightedServiceNames: [
+            ...new Set([
+              ...candidate.highlightedServiceNames,
+              ...(candidate.focusServiceName ? [candidate.focusServiceName] : []),
+            ]),
+          ],
+          selectedElement: candidate.selectedElement,
+        });
+      });
+
+      if (candidate.selectedElement.kind === "node") {
+        focusGraphNode(candidate.selectedElement.nodeId, { toggleSelection: false });
+        return;
+      }
+
+      focusGraphEdge(candidate.selectedElement);
+    },
+    [
+      activeInvestigationObjectId,
+      focusGraphEdge,
+      focusGraphNode,
+      viewState,
+    ]
+  );
+
   const focusInvestigationObject = useCallback(
     (item: InvestigationObject) => {
       if (!viewState) {
@@ -1212,7 +1320,8 @@ export function App() {
     return { tone: "neutral" as const, label: "no data" };
   }, [data, renderedGraph, totalServiceCount, visibleServiceCount]);
 
-  const headerSubtitle = data?.derived_scope?.explanation || data?.summary;
+  const headerSubtitle =
+    data?.rca_candidates?.[0]?.summary || data?.derived_scope?.explanation || data?.summary;
   const requestContext = data?.request_context;
   const pills = useMemo(() => {
     if (!requestContext || !viewState) {
@@ -1398,6 +1507,27 @@ export function App() {
     return items.sort((left, right) => right.score - left.score || left.title.localeCompare(right.title));
   }, [filterOptionCounts, viewState, visibleAlertOptions]);
 
+  const rcaCandidateStripItems = useMemo<InvestigationStripItem[]>(() => {
+    if (!data?.rca_candidates?.length) {
+      return [];
+    }
+
+    return data.rca_candidates.slice(0, 3).map((candidate) => ({
+      id: `rca-${candidate.id}`,
+      kind: "rca" as const,
+      title: candidate.title,
+      subtitle: candidate.subtitle,
+      shortLabel: "Hyp",
+      badge: undefined,
+      tone: candidate.tone,
+      selected:
+        activeInvestigationObjectId === `rca:${candidate.id}` ||
+        serviceMapSelectedElementsEqual(viewState?.selectedElement, candidate.selectedElement),
+      rcaCandidate: candidate,
+      score: candidate.score + 1000,
+    }));
+  }, [activeInvestigationObjectId, data?.rca_candidates, viewState?.selectedElement]);
+
   const investigationObjectStripItems = useMemo<InvestigationStripItem[]>(() => {
     if (!data?.investigation_objects?.length) {
       return [];
@@ -1495,9 +1625,21 @@ export function App() {
 
   const stripItems = useMemo<InvestigationStripItem[]>(
     () =>
-      [...investigationObjectStripItems, ...filterStripItems, ...serviceStripItems, ...resourceStripItems]
+      [
+        ...rcaCandidateStripItems,
+        ...investigationObjectStripItems,
+        ...filterStripItems,
+        ...serviceStripItems,
+        ...resourceStripItems,
+      ]
         .sort((left, right) => right.score - left.score || left.title.localeCompare(right.title)),
-    [filterStripItems, investigationObjectStripItems, resourceStripItems, serviceStripItems]
+    [
+      filterStripItems,
+      investigationObjectStripItems,
+      rcaCandidateStripItems,
+      resourceStripItems,
+      serviceStripItems,
+    ]
   );
 
   const searchSummaryLabel = searchResults.length
@@ -1704,11 +1846,18 @@ export function App() {
                   item.selected ? " is-selected" : ""
                 }`}
                 title={
-                  item.investigationObject?.summary
+                  item.rcaCandidate?.summary
+                    ? `${item.title} — ${item.subtitle}\n${item.rcaCandidate.summary}`
+                    : item.investigationObject?.summary
                     ? `${item.title} — ${item.subtitle}\n${item.investigationObject.summary}`
                     : `${item.title} — ${item.subtitle}`
                 }
                 onClick={() => {
+                  if (item.kind === "rca" && item.rcaCandidate) {
+                    focusRcaCandidate(item.rcaCandidate);
+                    return;
+                  }
+
                   if (item.kind === "object" && item.investigationObject) {
                     focusInvestigationObject(item.investigationObject);
                     return;
