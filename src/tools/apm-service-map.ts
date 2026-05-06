@@ -175,6 +175,7 @@ interface AlertContext {
   reason?: string;
   status?: string;
   serviceName?: string;
+  hostName?: string;
   environment?: string;
   transactionType?: string;
   transactionName?: string;
@@ -185,7 +186,21 @@ interface AlertContext {
   rangeTo?: string;
 }
 
+interface AlertContextSource {
+  "host.name"?: string;
+  "host.hostname"?: string;
+  "kibana.alert.instance.id"?: string;
+  "service.name"?: string;
+  "service.environment"?: string;
+  "kibana.alert.grouping"?: {
+    host?: {
+      name?: string;
+    };
+  };
+}
+
 interface AlertContextRow {
+  _source?: AlertContextSource;
   "@timestamp"?: string;
   "kibana.alert.uuid"?: string;
   "kibana.alert.rule.name"?: string;
@@ -197,6 +212,11 @@ interface AlertContextRow {
   "service.environment"?: string;
   "transaction.type"?: string;
   "transaction.name"?: string;
+}
+
+interface ServiceNameLookupRow {
+  "service.name"?: string;
+  docs?: number;
 }
 
 interface ServiceMapRcaCandidate {
@@ -504,6 +524,54 @@ function resolveAlertTimeRange(row: AlertContextRow): { rangeFrom?: string; rang
   };
 }
 
+function normalizeStringValue(value: string | undefined): string | undefined {
+  const normalized = value?.trim();
+  return normalized || undefined;
+}
+
+function getAlertHostName(row: AlertContextRow): string | undefined {
+  const source = row._source;
+  return (
+    normalizeStringValue(source?.["host.name"]) ||
+    normalizeStringValue(source?.["host.hostname"]) ||
+    normalizeStringValue(source?.["kibana.alert.grouping"]?.host?.name) ||
+    normalizeStringValue(source?.["kibana.alert.instance.id"])
+  );
+}
+
+async function fetchServiceNameForAlertHost(args: {
+  hostName?: string;
+  rangeFrom?: string;
+  rangeTo?: string;
+  errors: string[];
+}): Promise<string | undefined> {
+  if (!args.hostName) {
+    return undefined;
+  }
+
+  let timeWindow: TimeWindow;
+  try {
+    timeWindow = resolveTimeWindow(args.rangeFrom, args.rangeTo);
+  } catch {
+    timeWindow = resolveTimeWindow();
+  }
+
+  const rows = await safeEsqlRows<ServiceNameLookupRow>(
+    `
+FROM metrics-*,metricbeat-*
+| WHERE ${buildTimestampClause(timeWindow)}
+  AND host.name == "${escapeEsql(args.hostName)}"
+  AND service.name IS NOT NULL
+| STATS docs = COUNT(*) BY service.name
+| SORT docs DESC
+| LIMIT 1
+`,
+    args.errors
+  );
+
+  return normalizeStringValue(rows[0]?.["service.name"]);
+}
+
 async function fetchAlertContext(args: {
   alertId?: string;
   alertUrl?: string;
@@ -516,9 +584,9 @@ async function fetchAlertContext(args: {
 
   const rows = await safeEsqlRows<AlertContextRow>(
     `
-FROM .alerts-observability*
+FROM .alerts-observability* METADATA _source
 | WHERE kibana.alert.uuid == "${escapeEsql(id)}"
-| KEEP @timestamp, kibana.alert.uuid, kibana.alert.rule.name, kibana.alert.reason, kibana.alert.status, kibana.alert.start, kibana.alert.end, service.name, service.environment, transaction.type, transaction.name
+| KEEP _source, @timestamp, kibana.alert.uuid, kibana.alert.rule.name, kibana.alert.reason, kibana.alert.status, kibana.alert.start, kibana.alert.end, service.name, service.environment, transaction.type, transaction.name
 | SORT @timestamp DESC
 | LIMIT 1
 `,
@@ -534,14 +602,26 @@ FROM .alerts-observability*
   }
 
   const { rangeFrom, rangeTo } = resolveAlertTimeRange(row);
+  const hostName = getAlertHostName(row);
+  const serviceName =
+    normalizeStringValue(row["service.name"]) ||
+    normalizeStringValue(row._source?.["service.name"]) ||
+    (await fetchServiceNameForAlertHost({
+      hostName,
+      rangeFrom,
+      rangeTo,
+      errors: args.errors,
+    }));
+
   return {
     id,
     url: args.alertUrl?.trim(),
     ruleName: row["kibana.alert.rule.name"],
     reason: row["kibana.alert.reason"],
     status: row["kibana.alert.status"],
-    serviceName: row["service.name"],
-    environment: row["service.environment"],
+    serviceName,
+    hostName,
+    environment: row["service.environment"] || row._source?.["service.environment"],
     transactionType: row["transaction.type"],
     transactionName: row["transaction.name"],
     timestamp: row["@timestamp"],
@@ -1624,14 +1704,10 @@ FROM traces-apm*,traces-*.otel-*
       candidate.highlightedServiceNames.includes(alertServiceName)
   );
   if (alertServiceCandidates.length === 0) {
-    return rankedCandidates.slice(0, MAX_RCA_CANDIDATES);
+    return [];
   }
 
-  const alertCandidateIds = new Set(alertServiceCandidates.map((candidate) => candidate.id));
-  return [
-    ...alertServiceCandidates,
-    ...rankedCandidates.filter((candidate) => !alertCandidateIds.has(candidate.id)),
-  ].slice(0, MAX_RCA_CANDIDATES);
+  return alertServiceCandidates.slice(0, MAX_RCA_CANDIDATES);
 }
 
 function getServiceCount(graph: KibanaPortableServiceMapResponse): number {

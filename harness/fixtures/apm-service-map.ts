@@ -704,6 +704,12 @@ export const apmServiceMapFixtures: FixtureSet = {
           anomalyStatusFilter: [],
         },
         orientation: "horizontal",
+        selectedElement: {
+          kind: "edge",
+          edgeId: "product-recommendation~inventory-service",
+          source: "product-recommendation",
+          target: "inventory-service",
+        },
       },
       graph: {
         nodes: incidentNodes(["frontend-web"]),
@@ -715,6 +721,83 @@ export const apmServiceMapFixtures: FixtureSet = {
         full_map_url:
           "http://localhost:5601/app/apm#/services/frontend-web/service-map?rangeFrom=now-45m&rangeTo=now&environment=Synthtrace%3A+cascading_failure",
       },
+      rca_candidates: [
+        {
+          id: "edge:product-recommendation~inventory-service",
+          kind: "edge",
+          title: "product-recommendation -> inventory-service",
+          subtitle: "96% failing · 48/50 spans",
+          summary:
+            "The product-recommendation to inventory-service dependency is failing 96% of spans in this window.",
+          shortLabel: "RC",
+          tone: "critical",
+          score: 1480,
+          focusServiceName: "product-recommendation",
+          highlightedServiceNames: ["product-recommendation", "inventory-service"],
+          selectedElement: {
+            kind: "edge",
+            edgeId: "product-recommendation~inventory-service",
+            source: "product-recommendation",
+            target: "inventory-service",
+          },
+          kibanaUrl:
+            "http://localhost:5601/app/apm#/services/product-recommendation/service-map?rangeFrom=now-45m&rangeTo=now&environment=Synthtrace%3A+cascading_failure",
+          serviceName: "product-recommendation",
+          targetLabel: "inventory-service",
+          failures: 48,
+          total: 50,
+          failureRate: 0.96,
+        },
+        {
+          id: "service:product-recommendation:GET /recommendations",
+          kind: "service",
+          title: "product-recommendation",
+          subtitle: "96% failing · GET /recommendations",
+          summary:
+            "GET /recommendations on product-recommendation is failing with the same map focus as the inventory dependency.",
+          shortLabel: "RS",
+          tone: "critical",
+          score: 1440,
+          focusServiceName: "product-recommendation",
+          highlightedServiceNames: ["inventory-service", "product-recommendation"],
+          selectedElement: {
+            kind: "edge",
+            edgeId: "product-recommendation~inventory-service",
+            source: "product-recommendation",
+            target: "inventory-service",
+          },
+          kibanaUrl:
+            "http://localhost:5601/app/apm#/services/product-recommendation/service-map?rangeFrom=now-45m&rangeTo=now&environment=Synthtrace%3A+cascading_failure",
+          serviceName: "product-recommendation",
+          transactionName: "GET /recommendations",
+          failures: 48,
+          total: 50,
+          failureRate: 0.96,
+        },
+        {
+          id: "service:frontend-web:GET /",
+          kind: "service",
+          title: "frontend-web",
+          subtitle: "65% failing · GET /",
+          summary: "GET / on frontend-web is failing 65% of transactions.",
+          shortLabel: "RS",
+          tone: "warning",
+          score: 1080,
+          focusServiceName: "frontend-web",
+          highlightedServiceNames: ["frontend-web"],
+          selectedElement: {
+            kind: "node",
+            nodeId: "frontend-web",
+          },
+          kibanaUrl:
+            "http://localhost:5601/app/apm#/services/frontend-web/service-map?rangeFrom=now-45m&rangeTo=now&environment=Synthtrace%3A+cascading_failure",
+          serviceName: "frontend-web",
+          transactionName: "GET /",
+          failures: 13,
+          total: 20,
+          failureRate: 0.65,
+        },
+      ],
       investigation_objects: [
         {
           id: "alert:frontend-web-latency:cluster:search-demo",

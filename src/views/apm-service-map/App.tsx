@@ -187,6 +187,38 @@ interface InvestigationStripItem {
   score: number;
 }
 
+function getRcaCandidateFocusKey(candidate: RcaCandidate): string {
+  const selectedElementKey =
+    candidate.selectedElement.kind === "node"
+      ? `node:${candidate.selectedElement.nodeId}`
+      : `edge:${candidate.selectedElement.edgeId ?? ""}:${candidate.selectedElement.source ?? ""}:${
+          candidate.selectedElement.target ?? ""
+        }`;
+
+  return JSON.stringify({
+    selectedElement: selectedElementKey,
+    focusServiceName: candidate.focusServiceName ?? "",
+    highlightedServiceNames: [...new Set(candidate.highlightedServiceNames)].sort(),
+  });
+}
+
+function getDistinctRcaCandidates(candidates: RcaCandidate[]): RcaCandidate[] {
+  const focusKeys = new Set<string>();
+  const distinctCandidates: RcaCandidate[] = [];
+
+  for (const candidate of candidates) {
+    const focusKey = getRcaCandidateFocusKey(candidate);
+    if (focusKeys.has(focusKey)) {
+      continue;
+    }
+
+    focusKeys.add(focusKey);
+    distinctCandidates.push(candidate);
+  }
+
+  return distinctCandidates;
+}
+
 function serializeViewState(viewState: PortableServiceMapViewState): string {
   return JSON.stringify(viewState);
 }
@@ -212,6 +244,7 @@ function buildCurrentFullMapUrl(
   hashParams.set("rangeTo", viewState.rangeTo);
   hashParams.set("environment", viewState.environment);
   hashParams.set("serviceMapState", serializeViewState(viewState));
+  hashParams.set("mapOrientation", viewState.orientation);
 
   if (viewState.kuery) {
     hashParams.set("kuery", viewState.kuery);
@@ -1512,20 +1545,22 @@ export function App() {
       return [];
     }
 
-    return data.rca_candidates.slice(0, 3).map((candidate) => ({
-      id: `rca-${candidate.id}`,
-      kind: "rca" as const,
-      title: candidate.title,
-      subtitle: candidate.subtitle,
-      shortLabel: "Hyp",
-      badge: undefined,
-      tone: candidate.tone,
-      selected:
-        activeInvestigationObjectId === `rca:${candidate.id}` ||
-        serviceMapSelectedElementsEqual(viewState?.selectedElement, candidate.selectedElement),
-      rcaCandidate: candidate,
-      score: candidate.score + 1000,
-    }));
+    return getDistinctRcaCandidates(data.rca_candidates)
+      .slice(0, 3)
+      .map((candidate) => ({
+        id: `rca-${candidate.id}`,
+        kind: "rca" as const,
+        title: candidate.title,
+        subtitle: candidate.subtitle,
+        shortLabel: "Hyp",
+        badge: undefined,
+        tone: candidate.tone,
+        selected:
+          activeInvestigationObjectId === `rca:${candidate.id}` ||
+          serviceMapSelectedElementsEqual(viewState?.selectedElement, candidate.selectedElement),
+        rcaCandidate: candidate,
+        score: candidate.score + 1000,
+      }));
   }, [activeInvestigationObjectId, data?.rca_candidates, viewState?.selectedElement]);
 
   const investigationObjectStripItems = useMemo<InvestigationStripItem[]>(() => {
@@ -1847,7 +1882,7 @@ export function App() {
                 }`}
                 title={
                   item.rcaCandidate?.summary
-                    ? `${item.title} — ${item.subtitle}\n${item.rcaCandidate.summary}`
+                    ? `${item.title} — ${item.subtitle}\nHypothesis: ${item.rcaCandidate.summary}\nClick to focus the map on this suggested RCA.`
                     : item.investigationObject?.summary
                     ? `${item.title} — ${item.subtitle}\n${item.investigationObject.summary}`
                     : `${item.title} — ${item.subtitle}`
