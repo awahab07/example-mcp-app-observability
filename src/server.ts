@@ -14,6 +14,7 @@ import { registerApmServiceDependenciesTool } from "./tools/apm-service-dependen
 import { registerManageAlertsTool } from "./tools/manage-alerts.js";
 import { registerSetupDismissTool } from "./tools/setup-dismiss.js";
 import { registerAnalyticsTools } from "./tools/analytics.js";
+import { registerLlmAiObsTool } from "./tools/llm-ai-obs.js";
 import { isKibanaConfigured } from "./elastic/client.js";
 import { noopAnalyticsClient, type AnalyticsClient } from "./elastic/analytics/index.js";
 
@@ -28,6 +29,7 @@ export function createServer(analytics: AnalyticsClient = noopAnalyticsClient): 
   registerApmHealthSummaryTool(server, analytics);
   registerK8sBlastRadiusTool(server, analytics);
   registerApmServiceDependenciesTool(server, analytics);
+  registerLlmAiObsTool(server, analytics);
 
   if (isKibanaConfigured()) {
     registerManageAlertsTool(server, analytics);
